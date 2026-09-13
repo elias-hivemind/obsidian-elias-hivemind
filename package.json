@@ -1,6 +1,6 @@
 {
   "name": "elias-hivemind",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Elias HiveMind - local and backend note summarization plus link suggestion for Obsidian",
   "main": "dist/main.js",
   "private": true,

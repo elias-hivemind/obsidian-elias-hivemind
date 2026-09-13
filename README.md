@@ -132,7 +132,7 @@ This runs `npm ci` and `npm run build`, then copies `main.js` and `manifest.json
 
 ### Option 3: From a release zip
 
-No releases have been published yet. Each release will include `main.js` and `manifest.json` as separate downloads, plus `elias-hivemind-<version>.zip`, which contains the same files at the top level of the archive.
+Every release includes `main.js`, `manifest.json` and `styles.css` as separate downloads, plus `elias-hivemind-<version>.zip`, which contains the same files at the top level of the archive.
 
 1. From the project's GitHub **Releases** page, download `main.js` and `manifest.json`, or download the zip.
 2. Put the files (or the zip's contents) directly into `<vault>/.obsidian/plugins/elias-hivemind/`. Don't extract the zip into a subfolder.
@@ -264,7 +264,7 @@ All commands appear in the command palette prefixed with **Elias HiveMind Plugin
 |---|---|---|
 | Maximum suggestions | `20` | Upper bound on unlinked mentions offered at once (5–100). |
 | Minimum title length | `4` | Titles and aliases shorter than this are ignored (2–15). |
-| Ignore folders | `.obsidian, .trash, templates` | Comma-separated folder paths excluded from link suggestions. |
+| Ignore folders | `.trash, templates` | Comma-separated folder paths excluded from link suggestions. The vault's configuration folder (`.obsidian` unless you renamed it) is always excluded, whether or not it is listed here. |
 
 ### Prompts (no settings-tab control)
 
