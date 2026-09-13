@@ -35,6 +35,7 @@ import {
   RequestUrlParam,
   RequestUrlResponse,
   Setting,
+  SettingDefinitionItem,
   TFile,
   requestUrl,
 } from 'obsidian';
@@ -82,7 +83,7 @@ const DEFAULT_SETTINGS: EliasHiveMindSettings = {
   maxTags: 5,
   maxLinkSuggestions: 20,
   minTitleLength: 4,
-  ignoreFolders: '.obsidian, .trash, templates',
+  ignoreFolders: '.trash, templates',
 };
 
 /* ========================================================================== */
@@ -287,9 +288,11 @@ async function requestWithTimeout(
 
   // requestUrl exposes no timeout, so the promise is raced instead. The
   // underlying request is not aborted; this only stops the UI hanging.
-  let timer: ReturnType<typeof setTimeout> | undefined;
+  // window.setTimeout / window.clearTimeout rather than the bare globals, so
+  // the timer belongs to the window the code runs in (popout windows included).
+  let timer: ReturnType<typeof window.setTimeout> | undefined;
   const timeout = new Promise<never>((_resolve, reject) => {
-    timer = setTimeout(
+    timer = window.setTimeout(
       () => reject(new Error(`Backend did not respond within ${timeoutMs} ms.`)),
       timeoutMs
     );
@@ -298,7 +301,7 @@ async function requestWithTimeout(
   try {
     return await Promise.race([request, timeout]);
   } finally {
-    if (timer !== undefined) clearTimeout(timer);
+    if (timer !== undefined) window.clearTimeout(timer);
   }
 }
 
@@ -602,7 +605,12 @@ function findLinkSuggestions(
   settings: EliasHiveMindSettings
 ): LinkSuggestion[] {
   const haystack = toLinkHaystack(markdown).toLowerCase();
-  const ignored = parseIgnoreFolders(settings.ignoreFolders);
+  // The configuration folder is not necessarily ".obsidian" - the user can
+  // rename it - so it is read from the vault and always ignored, on top of
+  // whatever the user listed.
+  const ignored = parseIgnoreFolders(
+    `${app.vault.configDir}, ${settings.ignoreFolders}`
+  );
 
   // Titles already linked from this note are not worth suggesting again.
   const alreadyLinked = new Set<string>();
@@ -696,74 +704,54 @@ class ChoiceModal<T> extends Modal {
   }
 
   onOpen(): void {
-    // Standard DOM only - Obsidian's createEl helpers are avoided so that
-    // types/obsidian.d.ts never has to augment HTMLElement. All presentation
-    // lives in styles.css: assigning el.style.* from a string literal trips
+    // Obsidian's createEl helpers rather than document.createElement: they
+    // build the node in the element's own document, which is what makes the
+    // modal render correctly in popout windows. All presentation still lives
+    // in styles.css - assigning el.style.* from a string literal trips
     // obsidianmd/no-static-styles-assignment at ERROR severity.
     const { contentEl, titleEl, config } = this;
-    titleEl.textContent = config.title;
-    contentEl.textContent = '';
+    titleEl.setText(config.title);
+    contentEl.empty();
 
-    const intro = document.createElement('p');
-    intro.textContent = config.intro;
-    contentEl.appendChild(intro);
+    contentEl.createEl('p', { text: config.intro });
 
-    const list = document.createElement('div');
-    list.classList.add('ehm-suggestion-list');
+    const list = contentEl.createDiv({ cls: 'ehm-suggestion-list' });
 
     config.items.forEach((item, index) => {
-      const row = document.createElement('label');
-      row.classList.add('ehm-suggestion-row');
+      const row = list.createEl('label', { cls: 'ehm-suggestion-row' });
 
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
+      const checkbox = row.createEl('input', { attr: { type: 'checkbox' } });
       checkbox.checked = true;
       checkbox.addEventListener('change', () => {
         if (checkbox.checked) this.selected.add(index);
         else this.selected.delete(index);
       });
 
-      const label = document.createElement('span');
-      label.textContent = config.label(item);
-
-      row.appendChild(checkbox);
-      row.appendChild(label);
+      row.createEl('span', { text: config.label(item) });
 
       if (config.meta) {
-        const meta = document.createElement('small');
-        meta.classList.add('ehm-suggestion-meta');
-        meta.textContent = config.meta(item);
-        row.appendChild(meta);
+        row.createEl('small', { cls: 'ehm-suggestion-meta', text: config.meta(item) });
       }
-
-      list.appendChild(row);
     });
 
-    contentEl.appendChild(list);
+    const buttons = contentEl.createDiv({ cls: 'ehm-modal-buttons' });
 
-    const buttons = document.createElement('div');
-    buttons.classList.add('ehm-modal-buttons');
-
-    const cancel = document.createElement('button');
-    cancel.textContent = 'Cancel';
+    const cancel = buttons.createEl('button', { text: 'Cancel' });
     cancel.addEventListener('click', () => this.close());
 
-    const insert = document.createElement('button');
-    insert.textContent = config.confirmText;
-    insert.classList.add('mod-cta');
+    const insert = buttons.createEl('button', {
+      cls: 'mod-cta',
+      text: config.confirmText,
+    });
     insert.addEventListener('click', () => {
       const chosen = config.items.filter((_item, i) => this.selected.has(i));
       this.close();
       config.onSubmit(chosen);
     });
-
-    buttons.appendChild(cancel);
-    buttons.appendChild(insert);
-    contentEl.appendChild(buttons);
   }
 
   onClose(): void {
-    this.contentEl.textContent = '';
+    this.contentEl.empty();
   }
 }
 
@@ -1122,12 +1110,29 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
         }
       )
       .then(() => {
-        if (this.visible) this.display();
+        if (this.visible) this.refresh();
       });
   }
 
+  /**
+   * Re-renders the tab. On Obsidian 1.13.0+ the tab is built from
+   * getSettingDefinitions(), so update() is the refresh path; on older
+   * versions display() still owns the DOM.
+   */
+  private refresh(): void {
+    if (typeof this.update === 'function') this.update();
+    else this.display();
+  }
+
   private renderModelSetting(containerEl: HTMLElement): void {
-    const setting = new Setting(containerEl).setName('Model');
+    this.configureModelSetting(new Setting(containerEl));
+  }
+
+  /** Applies the Model row's description, control and Refresh button. */
+  private configureModelSetting(setting: Setting): void {
+    setting.setName('Model');
+    this.visible = true;
+    if (this.modelState === 'idle') this.loadModels();
     const current = this.plugin.settings.backendModel;
 
     if (this.modelState === 'loaded' && this.models.length > 0) {
@@ -1172,16 +1177,20 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
     setting.addButton((button) =>
       button.setButtonText('Refresh').onClick(() => {
         this.loadModels();
-        this.display();
+        this.refresh();
       })
     );
   }
 
+  /**
+   * Imperative fallback for Obsidian versions older than 1.13.0. On 1.13.0+
+   * this is never called - getSettingDefinitions() below renders the tab and
+   * feeds the settings search index.
+   */
   display(): void {
     const { containerEl } = this;
-    containerEl.textContent = '';
+    containerEl.empty();
     this.visible = true;
-    if (this.modelState === 'idle') this.loadModels();
 
     new Setting(containerEl).setName('Summarization').setHeading();
 
@@ -1259,7 +1268,7 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
             this.plugin.settings.backendFormat = value as BackendFormat;
             void this.plugin.saveSettings();
             this.loadModels();
-            this.display();
+            this.refresh();
           })
       );
 
@@ -1343,12 +1352,229 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
       .setDesc('Comma-separated folder paths excluded from link suggestions.')
       .addText((text) =>
         text
-          .setPlaceholder('.obsidian, .trash, templates')
+          .setPlaceholder(this.ignoreFoldersPlaceholder())
           .setValue(this.plugin.settings.ignoreFolders)
           .onChange((value) => {
             this.plugin.settings.ignoreFolders = value;
             void this.plugin.saveSettings();
           })
       );
+  }
+
+  /** The configuration folder is user-renameable, so the hint is built at runtime. */
+  private ignoreFoldersPlaceholder(): string {
+    return `${this.app.vault.configDir}, .trash, templates`;
+  }
+
+  /* ------------------------------------------------------------------------ */
+  /*                    declarative settings (Obsidian 1.13.0+)               */
+  /* ------------------------------------------------------------------------ */
+
+  /** Reads a control's current value out of the plugin's own settings object. */
+  getControlValue(key: string): unknown {
+    return (this.plugin.settings as unknown as Record<string, unknown>)[key];
+  }
+
+  /** Persists a control's new value, preserving the coercions display() applies. */
+  setControlValue(key: string, value: unknown): void {
+    const settings = this.plugin.settings as unknown as Record<string, unknown>;
+
+    switch (key) {
+      case 'backendUrl':
+        settings[key] = String(value).trim();
+        // Refetched on the next open or Refresh, not per keystroke.
+        this.modelState = 'idle';
+        break;
+
+      case 'backendModel':
+        settings[key] = String(value).trim();
+        break;
+
+      case 'backendTimeoutMs': {
+        const parsed = Number.parseInt(String(value), 10);
+        settings[key] =
+          Number.isFinite(parsed) && parsed > 0 ? parsed : DEFAULT_SETTINGS.backendTimeoutMs;
+        break;
+      }
+
+      case 'backendFormat':
+        settings[key] = value as BackendFormat;
+        void this.plugin.saveSettings();
+        this.loadModels();
+        this.refresh();
+        return;
+
+      default:
+        settings[key] = value;
+    }
+
+    void this.plugin.saveSettings();
+  }
+
+  getSettingDefinitions(): SettingDefinitionItem[] {
+    return [
+      {
+        type: 'group',
+        heading: 'Summarization',
+        items: [
+          {
+            name: 'Summary length',
+            desc: 'How many sentences the local summariser keeps, and what the backend is asked for.',
+            control: {
+              type: 'slider',
+              key: 'summarySentenceCount',
+              min: 1,
+              max: 10,
+              step: 1,
+              defaultValue: DEFAULT_SETTINGS.summarySentenceCount,
+            },
+          },
+          {
+            name: 'Summary heading',
+            desc: 'Markdown heading placed above an inserted summary. Leave blank for none.',
+            control: {
+              type: 'text',
+              key: 'summaryHeading',
+              placeholder: '## Summary',
+              defaultValue: DEFAULT_SETTINGS.summaryHeading,
+            },
+          },
+          {
+            name: 'Insert position',
+            desc: 'Where a generated summary is written into the note.',
+            control: {
+              type: 'dropdown',
+              key: 'insertMode',
+              options: {
+                top: 'Top of note',
+                bottom: 'Bottom of note',
+                cursor: 'At cursor',
+              },
+              defaultValue: DEFAULT_SETTINGS.insertMode,
+            },
+          },
+        ],
+      },
+      {
+        type: 'group',
+        heading: 'Backend',
+        items: [
+          {
+            name: 'Backend URL',
+            desc:
+              'Full endpoint URL. Defaults to a local Ollama server, so note content stays on this machine. ' +
+              'Point this elsewhere only if you intend note text to leave the device.',
+            control: {
+              type: 'text',
+              key: 'backendUrl',
+              placeholder: DEFAULT_SETTINGS.backendUrl,
+              defaultValue: DEFAULT_SETTINGS.backendUrl,
+            },
+          },
+          {
+            name: 'Request format',
+            desc: 'Ollama uses {model, prompt}. OpenAI-compatible uses {model, messages[]}.',
+            control: {
+              type: 'dropdown',
+              key: 'backendFormat',
+              options: { ollama: 'Ollama', openai: 'OpenAI-compatible' },
+              defaultValue: DEFAULT_SETTINGS.backendFormat,
+            },
+          },
+          {
+            // The model row switches between a dropdown and a text field as the
+            // installed-model list loads, so it stays imperative.
+            name: 'Model',
+            aliases: ['ollama', 'llama'],
+            render: (setting) => {
+              this.configureModelSetting(setting);
+            },
+          },
+          {
+            name: 'Fall back to local',
+            desc: 'If the backend is offline, times out or returns an error, use the local summariser and tagger instead of failing.',
+            control: {
+              type: 'toggle',
+              key: 'fallbackToLocal',
+              defaultValue: DEFAULT_SETTINGS.fallbackToLocal,
+            },
+          },
+          {
+            name: 'Timeout (ms)',
+            desc: 'How long to wait before giving up on the backend.',
+            control: {
+              type: 'number',
+              key: 'backendTimeoutMs',
+              placeholder: String(DEFAULT_SETTINGS.backendTimeoutMs),
+              min: 1,
+              step: 1,
+              defaultValue: DEFAULT_SETTINGS.backendTimeoutMs,
+              validate: (value) =>
+                Number.isFinite(value) && value > 0
+                  ? undefined
+                  : 'Enter a positive whole number of milliseconds.',
+            },
+          },
+        ],
+      },
+      {
+        type: 'group',
+        heading: 'Tags',
+        items: [
+          {
+            name: 'Maximum tags',
+            desc: 'Upper bound on how many new tags are suggested at once.',
+            control: {
+              type: 'slider',
+              key: 'maxTags',
+              min: 1,
+              max: 15,
+              step: 1,
+              defaultValue: DEFAULT_SETTINGS.maxTags,
+            },
+          },
+        ],
+      },
+      {
+        type: 'group',
+        heading: 'Link suggestion',
+        items: [
+          {
+            name: 'Maximum suggestions',
+            desc: 'Upper bound on how many unlinked mentions are offered at once.',
+            control: {
+              type: 'slider',
+              key: 'maxLinkSuggestions',
+              min: 5,
+              max: 100,
+              step: 5,
+              defaultValue: DEFAULT_SETTINGS.maxLinkSuggestions,
+            },
+          },
+          {
+            name: 'Minimum title length',
+            desc: 'Ignore note titles shorter than this, which otherwise match noisily.',
+            control: {
+              type: 'slider',
+              key: 'minTitleLength',
+              min: 2,
+              max: 15,
+              step: 1,
+              defaultValue: DEFAULT_SETTINGS.minTitleLength,
+            },
+          },
+          {
+            name: 'Ignore folders',
+            desc: 'Comma-separated folder paths excluded from link suggestions. The vault configuration folder is always excluded.',
+            control: {
+              type: 'text',
+              key: 'ignoreFolders',
+              placeholder: this.ignoreFoldersPlaceholder(),
+              defaultValue: DEFAULT_SETTINGS.ignoreFolders,
+            },
+          },
+        ],
+      },
+    ];
   }
 }

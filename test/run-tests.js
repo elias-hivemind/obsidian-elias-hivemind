@@ -4,8 +4,9 @@
  * These deliberately exercise the bundle rather than the TypeScript source,
  * because the bundle is what Obsidian actually evaluates. The 'obsidian'
  * module is stubbed the same way Obsidian injects it, and a minimal document
- * shim lets the modal render so the link-suggestion flow can be driven to
- * completion.
+ * shim - including the Obsidian DOM helpers (createEl, createDiv, empty,
+ * setText) and a window carrying the timer functions - lets the modal render
+ * so the link-suggestion flow can be driven to completion.
  *
  * Run: node test/run-tests.js
  */
@@ -44,10 +45,37 @@ function makeEl(tag) {
     addEventListener(ev, fn) { (this._listeners[ev] = this._listeners[ev] || []).push(fn); },
     click() { (this._listeners.click || []).forEach((fn) => fn({})); },
     dispatchChange() { (this._listeners.change || []).forEach((fn) => fn({})); },
+
+    /* Obsidian's HTMLElement helpers, mirrored from obsidian.d.ts. */
+    setText(value) { this.textContent = value; return this; },
+    empty() { this.children.length = 0; this.textContent = ''; },
+    createEl(childTag, info, callback) {
+      const el = makeEl(childTag);
+      applyElInfo(el, info);
+      this.appendChild(el);
+      if (callback) callback(el);
+      return el;
+    },
+    createDiv(info, callback) { return this.createEl('div', info, callback); },
   };
 }
 
+/** Applies a DomElementInfo object the way Obsidian's createEl does. */
+function applyElInfo(el, info) {
+  if (!info) return;
+  if (info.cls) {
+    const classes = Array.isArray(info.cls) ? info.cls : [info.cls];
+    classes.forEach((c) => el.classList.add(c));
+  }
+  if (info.text !== undefined) el.textContent = info.text;
+  if (info.attr) Object.assign(el, info.attr);
+}
+
 global.document = { createElement: makeEl };
+
+// Obsidian runs in a browser; the plugin uses window.setTimeout/clearTimeout
+// so its timers belong to the window the code runs in (popout windows).
+global.window = { setTimeout, clearTimeout };
 
 /** Depth-first walk of the shim element tree. */
 function walk(el, out) {
@@ -546,6 +574,47 @@ async function main() {
   tabErr = null;
   try { tab.display(); await flush(); } catch (e) { tabErr = e; }
   check('display() with backend offline ran clean', tabErr === null && tab.modelState === 'failed', tabErr ? tabErr.message : tab.modelState);
+
+  console.log('\n[10f] declarative settings definitions (Obsidian 1.13.0+)');
+  const defs = tab.getSettingDefinitions();
+  const groups = defs.map((d) => d.heading);
+  check('four groups, in display() order',
+    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Tags', 'Link suggestion']),
+    JSON.stringify(groups));
+
+  const allItems = defs.flatMap((g) => g.items || []);
+  const controlKeys = allItems.filter((i) => i.control).map((i) => i.control.key).sort();
+  const expectedKeys = [
+    'backendFormat', 'backendTimeoutMs', 'backendUrl', 'fallbackToLocal',
+    'ignoreFolders', 'insertMode', 'maxLinkSuggestions', 'maxTags',
+    'minTitleLength', 'summaryHeading', 'summarySentenceCount',
+  ];
+  check('every persisted setting except backendModel has a control',
+    JSON.stringify(controlKeys) === JSON.stringify(expectedKeys), JSON.stringify(controlKeys));
+  check('every control key exists on the settings object',
+    controlKeys.every((k) => k in plugin.settings),
+    JSON.stringify(controlKeys.filter((k) => !(k in plugin.settings))));
+  check('model row is imperative (render, no control)',
+    allItems.some((i) => i.name === 'Model' && typeof i.render === 'function' && !i.control));
+  check('every item has a name', allItems.every((i) => typeof i.name === 'string' && i.name.length > 0));
+
+  check('getControlValue reads through to settings',
+    tab.getControlValue('summaryHeading') === plugin.settings.summaryHeading);
+  tab.setControlValue('summaryHeading', '### Recap');
+  check('setControlValue writes through to settings', plugin.settings.summaryHeading === '### Recap');
+  tab.setControlValue('backendTimeoutMs', '0');
+  check('non-positive timeout falls back to the default', plugin.settings.backendTimeoutMs === 60000,
+    String(plugin.settings.backendTimeoutMs));
+  tab.setControlValue('backendTimeoutMs', '15000');
+  check('valid timeout is stored as a number', plugin.settings.backendTimeoutMs === 15000);
+  tab.setControlValue('backendUrl', '  http://127.0.0.1:11434/api/generate  ');
+  check('backend URL is trimmed and invalidates the model list',
+    plugin.settings.backendUrl === 'http://127.0.0.1:11434/api/generate' && tab.modelState === 'idle',
+    plugin.settings.backendUrl + ' / ' + tab.modelState);
+
+  const timeoutDef = allItems.find((i) => i.control && i.control.key === 'backendTimeoutMs');
+  check('timeout validate() rejects zero', typeof timeoutDef.control.validate(0) === 'string');
+  check('timeout validate() accepts a positive number', timeoutDef.control.validate(1000) === undefined);
 
   console.log('\n[11] settings persistence round-trip');
   plugin.settings.summarySentenceCount = 7;
