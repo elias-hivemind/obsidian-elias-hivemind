@@ -1,0 +1,32 @@
+{
+  "name": "elias-hivemind",
+  "version": "1.0.0",
+  "description": "Elias HiveMind - local and backend note summarization plus link suggestion for Obsidian",
+  "main": "dist/main.js",
+  "private": true,
+  "license": "MIT",
+  "scripts": {
+    "build": "rollup -c",
+    "dev": "rollup -c -w",
+    "typecheck": "tsc --noEmit",
+    "clean": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\"",
+    "test": "node test/run-tests.js",
+    "install:vault": "node scripts/install-to-vault.js",
+    "ship": "npm run build && npm test && npm run install:vault",
+    "health": "node scripts/health.js",
+    "package": "node scripts/package.js"
+  },
+  "keywords": [
+    "obsidian",
+    "obsidian-plugin",
+    "elias-hivemind"
+  ],
+  "devDependencies": {
+    "@rollup/plugin-commonjs": "^29.0.3",
+    "@rollup/plugin-node-resolve": "^16.0.3",
+    "@rollup/plugin-typescript": "^12.3.0",
+    "rollup": "^4.63.2",
+    "tslib": "^2.8.1",
+    "typescript": "~5.9.3"
+  }
+}

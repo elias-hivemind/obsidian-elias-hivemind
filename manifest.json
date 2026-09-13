@@ -1,0 +1,9 @@
+{
+  "id": "elias-hivemind",
+  "name": "Elias HiveMind",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Summarize notes, suggest tags and find unlinked mentions, offline or with a local Ollama model.",
+  "author": "Elias HiveMind",
+  "isDesktopOnly": false
+}

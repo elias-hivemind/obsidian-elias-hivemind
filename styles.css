@@ -1,0 +1,45 @@
+/*
+ * Elias HiveMind - plugin styles.
+ *
+ * Everything here was previously assigned inline as el.style.* in the
+ * suggestion modal. Obsidian's automated review runs
+ * eslint-plugin-obsidianmd, where `no-static-styles-assignment` is an ERROR
+ * for any `element.style.prop = "literal"`, so presentation must live in a
+ * stylesheet and be applied via a class.
+ *
+ * Obsidian reads <plugin-folder>/styles.css once at load and injects it into
+ * <head>, so this file must ship alongside main.js and manifest.json - both in
+ * the vault plugin folder and as an individual GitHub release asset.
+ *
+ * Values use Obsidian's CSS variables where one exists, so the modal follows
+ * the user's theme instead of hardcoding colours.
+ */
+
+/* Scrollable list of suggestions inside the modal. */
+.ehm-suggestion-list {
+  max-height: 45vh;
+  overflow-y: auto;
+  margin: 0.75em 0;
+}
+
+/* One selectable row: checkbox, label, and optional right-aligned meta. */
+.ehm-suggestion-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  padding: 0.25em 0;
+  cursor: pointer;
+}
+
+/* Trailing detail on a row, e.g. occurrence count or "(alias)". */
+.ehm-suggestion-meta {
+  margin-left: auto;
+  color: var(--text-muted);
+}
+
+/* Right-aligned action row at the foot of the modal. */
+.ehm-modal-buttons {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5em;
+}

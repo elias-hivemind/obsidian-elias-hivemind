@@ -1,0 +1,13 @@
+node_modules/
+dist/
+build/
+.vscode/
+.DS_Store
+.env
+.env.local
+npm-debug.log
+yarn.lock
+coverage/
+
+# stray saved web page, never part of the plugin
+srch.html
