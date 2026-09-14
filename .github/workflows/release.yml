@@ -2,7 +2,9 @@ name: Release
 
 # Obsidian's community plugin registry expects the release tag to equal the
 # manifest version exactly (e.g. 1.0.0, no "v" prefix), and reads main.js,
-# manifest.json and styles.css as individual release assets.
+# manifest.json and styles.css as individual release assets. Only those three
+# files are attached to the release; the verified zip is kept as a workflow
+# artifact, because Obsidian ignores any other release file.
 on:
   push:
     tags:
@@ -11,6 +13,10 @@ on:
 
 permissions:
   contents: write
+  # Build provenance attestations for the release assets.
+  id-token: write
+  attestations: write
+  artifact-metadata: write
 
 jobs:
   release:
@@ -54,17 +60,27 @@ jobs:
           mkdir -p release
           cp dist/main.js manifest.json release/
           if [ -f styles.css ]; then cp styles.css release/; fi
-          cp build/*.zip release/
+
+      # Runs before the release is created, so a release is never published
+      # without attestations for its assets.
+      - name: Attest build provenance
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: actions/attest@v4
+        with:
+          subject-path: 'release/*'
 
       - name: Create GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
           files: release/*
 
       - name: Upload build artifact
         uses: actions/upload-artifact@v7
         with:
           name: plugin-release
-          path: release/*
+          path: |
+            release/*
+            build/*.zip

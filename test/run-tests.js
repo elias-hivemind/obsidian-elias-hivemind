@@ -4,8 +4,8 @@
  * These deliberately exercise the bundle rather than the TypeScript source,
  * because the bundle is what Obsidian actually evaluates. The 'obsidian'
  * module is stubbed the same way Obsidian injects it, and a minimal document
- * shim - including the Obsidian DOM helpers (createEl, createDiv, empty,
- * setText) and a window carrying the timer functions - lets the modal render
+ * shim - including the Obsidian DOM helpers (createEl, createDiv, createSpan,
+ * empty, setText) and a window carrying the timer functions - lets the modal render
  * so the link-suggestion flow can be driven to completion.
  *
  * Run: node test/run-tests.js
@@ -57,6 +57,7 @@ function makeEl(tag) {
       return el;
     },
     createDiv(info, callback) { return this.createEl('div', info, callback); },
+    createSpan(info, callback) { return this.createEl('span', info, callback); },
   };
 }
 

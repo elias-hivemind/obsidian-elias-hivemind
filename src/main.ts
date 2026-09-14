@@ -725,7 +725,7 @@ class ChoiceModal<T> extends Modal {
         else this.selected.delete(index);
       });
 
-      row.createEl('span', { text: config.label(item) });
+      row.createSpan({ text: config.label(item) });
 
       if (config.meta) {
         row.createEl('small', { cls: 'ehm-suggestion-meta', text: config.meta(item) });
@@ -1396,7 +1396,7 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
       }
 
       case 'backendFormat':
-        settings[key] = value as BackendFormat;
+        settings[key] = value;
         void this.plugin.saveSettings();
         this.loadModels();
         this.refresh();

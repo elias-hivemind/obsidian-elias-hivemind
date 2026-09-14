@@ -11,7 +11,7 @@
  *      inside the block, which would create a second conflicting binding.
  *   3. Exactly ONE lib.dom augmentation, at the bottom of this file: the
  *      handful of Obsidian DOM helpers the plugin calls (createEl, createDiv,
- *      empty, setText). Keep it minimal - redeclaring more of Obsidian's
+ *      createSpan, empty, setText). Keep it minimal - redeclaring more of Obsidian's
  *      HTMLElement surface is the single most common source of collisions
  *      with TypeScript's own lib.
  *   4. No top-level import or export in this file, so it stays a global
@@ -392,7 +392,7 @@ declare module 'obsidian' {
 
 /* ========================================================================== */
 /*      minimal lib.dom augmentation - Obsidian's DOM helpers, and only       */
-/*      the four this plugin actually calls (see rule 3 at the top)           */
+/*      the five this plugin actually calls (see rule 3 at the top)           */
 /* ========================================================================== */
 
 interface DomElementInfo {
@@ -411,6 +411,7 @@ interface HTMLElement {
     callback?: (el: HTMLElementTagNameMap[K]) => void
   ): HTMLElementTagNameMap[K];
   createDiv(o?: DomElementInfo, callback?: (el: HTMLDivElement) => void): HTMLDivElement;
+  createSpan(o?: DomElementInfo, callback?: (el: HTMLSpanElement) => void): HTMLSpanElement;
   empty(): void;
   setText(val: string | DocumentFragment): void;
 }
