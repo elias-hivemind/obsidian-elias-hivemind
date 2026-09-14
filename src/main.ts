@@ -605,9 +605,8 @@ function findLinkSuggestions(
   settings: EliasHiveMindSettings
 ): LinkSuggestion[] {
   const haystack = toLinkHaystack(markdown).toLowerCase();
-  // The configuration folder is not necessarily ".obsidian" - the user can
-  // rename it - so it is read from the vault and always ignored, on top of
-  // whatever the user listed.
+  // The user can rename the configuration folder, so its name is read from
+  // the vault and it is always ignored, on top of whatever the user listed.
   const ignored = parseIgnoreFolders(
     `${app.vault.configDir}, ${settings.ignoreFolders}`
   );
@@ -704,11 +703,10 @@ class ChoiceModal<T> extends Modal {
   }
 
   onOpen(): void {
-    // Obsidian's createEl helpers rather than document.createElement: they
-    // build the node in the element's own document, which is what makes the
-    // modal render correctly in popout windows. All presentation still lives
-    // in styles.css - assigning el.style.* from a string literal trips
-    // obsidianmd/no-static-styles-assignment at ERROR severity.
+    // Nodes are built with Obsidian's createEl helpers, which create them in
+    // the element's own document, so the modal renders correctly in popout
+    // windows. All presentation lives in styles.css; inline static styles
+    // trip obsidianmd/no-static-styles-assignment at ERROR severity.
     const { contentEl, titleEl, config } = this;
     titleEl.setText(config.title);
     contentEl.empty();

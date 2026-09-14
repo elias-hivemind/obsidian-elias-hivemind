@@ -1,9 +1,9 @@
-# Elias HiveMind Plugin
+# Elias HiveMind
 
 Summaries, tag suggestions and link suggestions for Obsidian, working offline by default and using a local Ollama model when you want one.
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.0.0
+- **Version:** 1.0.1
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -79,7 +79,7 @@ The chosen links are appended to the end of the note under a `## Suggested links
 |---|---|
 | Local commands | Obsidian 1.0.0 or newer. Nothing else. |
 | Backend commands | [Ollama](https://ollama.com) installed and running, with at least one model pulled. Any OpenAI-compatible server also works. |
-| Building from source | Node.js 18 or newer, plus npm. |
+| Building from source | Node.js 24 LTS (what the release workflow uses), plus npm. |
 
 ---
 
@@ -90,10 +90,11 @@ Obsidian loads a plugin from `<vault>/.obsidian/plugins/<plugin-id>/`. The folde
 ```
 <vault>/.obsidian/plugins/elias-hivemind/
 ├── manifest.json
-└── main.js
+├── main.js
+└── styles.css
 ```
 
-`main.js` must sit directly in that folder. A plugin whose code is only at `dist/main.js` will show up in Obsidian but fail to load when enabled.
+`main.js` must sit directly in that folder. `styles.css` isn't needed for the plugin to load, but without it the suggestion dialog is unstyled. A plugin whose code is only at `dist/main.js` will show up in Obsidian but fail to load when enabled.
 
 ### Option 1: Build from source and install manually
 
@@ -107,7 +108,8 @@ This creates `dist/main.js`. Then:
 1. Create the folder `<vault>/.obsidian/plugins/elias-hivemind/`.
 2. Copy `manifest.json` into it.
 3. Copy `dist/main.js` into it as `main.js`.
-4. In Obsidian, open **Settings → Community plugins**, turn on community plugins if they're off, and enable **Elias HiveMind Plugin**. If it isn't listed, use the reload button next to *Installed plugins*.
+4. Copy `styles.css` into it.
+5. In Obsidian, open **Settings → Community plugins**, turn on community plugins if they're off, and enable **Elias HiveMind**. If it isn't listed, use the reload button next to *Installed plugins*.
 
 ### Option 2: Use an install script
 
@@ -128,13 +130,13 @@ You can set the `OBSIDIAN_VAULT` environment variable instead of passing `--vaul
 ./install.sh /path/to/your/vault
 ```
 
-This runs `npm ci` and `npm run build`, then copies `main.js` and `manifest.json` into the plugin folder in that vault, creating the folder if needed. Existing files are overwritten, and saved settings (`data.json`) are kept.
+This runs `npm ci` and `npm run build`, then copies `main.js`, `manifest.json` and `styles.css` into the plugin folder in that vault, creating the folder if needed. Existing files are overwritten, and saved settings (`data.json`) are kept.
 
 ### Option 3: From a release zip
 
 Every release includes `main.js`, `manifest.json` and `styles.css` as separate downloads, plus `elias-hivemind-<version>.zip`, which contains the same files at the top level of the archive.
 
-1. From the project's GitHub **Releases** page, download `main.js` and `manifest.json`, or download the zip.
+1. From the project's GitHub **Releases** page, download `main.js`, `manifest.json` and `styles.css`, or download the zip.
 2. Put the files (or the zip's contents) directly into `<vault>/.obsidian/plugins/elias-hivemind/`. Don't extract the zip into a subfolder.
 3. Enable the plugin under **Settings → Community plugins**.
 
@@ -218,7 +220,7 @@ Notes:
 
 ## Commands
 
-All commands appear in the command palette prefixed with **Elias HiveMind Plugin:**.
+All commands appear in the command palette prefixed with **Elias HiveMind:**.
 
 | Command | Network | What it does |
 |---|---|---|
@@ -303,7 +305,7 @@ npm run typecheck   # TypeScript check, no output
 npm test            # functional tests against the built dist/main.js
 npm run health      # confirm dist/main.js exists and is not empty
 npm run clean       # delete dist/
-npm run package     # zip main.js + manifest.json into build/elias-hivemind-<version>.zip
+npm run package     # zip main.js + manifest.json + styles.css into build/elias-hivemind-<version>.zip
 ```
 
 `npm run package` needs no extra dependencies. Before writing the zip, it checks that `manifest.json`, `package.json` and `versions.json` all have the same version. After writing, it reads the zip back to verify every file.
@@ -318,7 +320,7 @@ npm run package     # zip main.js + manifest.json into build/elias-hivemind-<ver
    git push origin 1.0.1
    ```
 
-3. The **Release** workflow (`.github/workflows/release.yml`) runs typecheck, build, tests and packaging. It fails if the tag doesn't match `manifest.json`, and otherwise publishes a GitHub release with `main.js`, `manifest.json` and the zip attached.
+3. The **Release** workflow (`.github/workflows/release.yml`) runs typecheck, build, tests and packaging. It fails if the tag doesn't match `manifest.json`, and otherwise publishes a GitHub release with `main.js`, `manifest.json`, `styles.css` and the zip attached.
 
 `npm test` runs `test/run-tests.js`, which loads the **built bundle** with a stubbed Obsidian API and exercises every command: local and backend summaries, fallback on refused connections, timeouts and HTTP errors, tag normalisation and frontmatter merging, link suggestions, model listing for both request formats, and settings persistence. Run `npm run build` before `npm test`.
 

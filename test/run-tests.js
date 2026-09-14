@@ -272,6 +272,8 @@ async function main() {
     mkFile('Crown Operations'),
     mkFile('Forge Memory Vault'),
     mkFile('Template Scratch', 'templates'),
+    // Lives in a renamed configuration folder that is NOT in ignoreFolders.
+    mkFile('Config Leak', '.hivecfg'),
     mkFile('Zed'),
   ];
 
@@ -282,6 +284,8 @@ async function main() {
 
   const app = {
     vault: {
+      // Deliberately not ".obsidian": the plugin must read it, not assume it.
+      configDir: '.hivecfg',
       getName: () => 'TestVault',
       getMarkdownFiles: () => vaultFiles,
       getFiles: () => vaultFiles,
@@ -431,6 +435,7 @@ async function main() {
     '`Crown Operations` inside code should not count on its own.',
     'Also mentioned Crown Ops as an alias.',
     'Zed is too short a title to match by default.',
+    'Config Leak lives in the configuration folder and must never be offered.',
   ].join('\n');
 
   const linkEd = new MockEditor(linkNote);
@@ -464,6 +469,8 @@ async function main() {
     !inserted.split('## Suggested links')[1].includes('[[Daily Note]]'));
   check('ignored folder excluded',
     !inserted.split('## Suggested links')[1].includes('[[Template Scratch]]'));
+  check('vault configDir excluded even when not listed in ignoreFolders',
+    !inserted.split('## Suggested links')[1].includes('[[Config Leak]]'));
 
   console.log('\n[10] no unlinked mentions -> clean notice');
   const cleanEd = new MockEditor('Nothing here refers to any other note at all.');

@@ -43,8 +43,8 @@ declare module 'obsidian' {
 
   export class Vault {
     /**
-     * Name of the vault's configuration folder. Defaults to ".obsidian" but
-     * the user can rename it, so never hardcode that string.
+     * Name of the vault's configuration folder. The user can rename it, so
+     * always read it from here and never hardcode the default name.
      */
     configDir: string;
     getName(): string;
