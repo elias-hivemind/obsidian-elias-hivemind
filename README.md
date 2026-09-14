@@ -3,7 +3,7 @@
 Summaries, tag suggestions and link suggestions for Obsidian, working offline by default and using a local Ollama model when you want one.
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.0.1
+- **Version:** 1.0.2
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -67,6 +67,7 @@ The chosen links are appended to the end of the note under a `## Suggested links
 ## Privacy
 
 - **Local commands** (every command marked *local*, and *Suggest links for current note*) make no network requests.
+- **Suggest links for current note** reads the file list of the whole vault (the names, paths and aliases of your notes) to find mentions of them in the current note. It does this only when you run the command, and nothing it reads is stored or sent anywhere.
 - **Backend commands** send the note's plain text, with frontmatter and code blocks removed, to the **Backend URL** you configure. The default is `http://127.0.0.1:11434/api/generate`, a local Ollama server, so the text doesn't leave your computer unless you change that URL.
 - **Opening the settings tab** sends one request to the same server for its list of installed models. No note content is included.
 - The plugin doesn't collect or send any usage data.
@@ -132,13 +133,14 @@ You can set the `OBSIDIAN_VAULT` environment variable instead of passing `--vaul
 
 This runs `npm ci` and `npm run build`, then copies `main.js`, `manifest.json` and `styles.css` into the plugin folder in that vault, creating the folder if needed. Existing files are overwritten, and saved settings (`data.json`) are kept.
 
-### Option 3: From a release zip
+### Option 3: From a GitHub release
 
-Every release includes `main.js`, `manifest.json` and `styles.css` as separate downloads, plus `elias-hivemind-<version>.zip`, which contains the same files at the top level of the archive.
+Every release includes `main.js`, `manifest.json` and `styles.css` as separate downloads, the same three files Obsidian installs from the community directory. From 1.0.2 each file has a build provenance attestation.
 
-1. From the project's GitHub **Releases** page, download `main.js`, `manifest.json` and `styles.css`, or download the zip.
-2. Put the files (or the zip's contents) directly into `<vault>/.obsidian/plugins/elias-hivemind/`. Don't extract the zip into a subfolder.
-3. Enable the plugin under **Settings → Community plugins**.
+1. From the project's GitHub **Releases** page, download `main.js`, `manifest.json` and `styles.css`.
+2. Optionally, confirm a file was built from this repository: `gh attestation verify main.js --repo elias-hivemind/obsidian-elias-hivemind`.
+3. Put the files directly into `<vault>/.obsidian/plugins/elias-hivemind/`.
+4. Enable the plugin under **Settings → Community plugins**.
 
 ---
 
@@ -312,15 +314,15 @@ npm run package     # zip main.js + manifest.json + styles.css into build/elias-
 
 ### Releasing
 
-1. Set the new version in `manifest.json` and `package.json`, and add it to `versions.json` mapped to the minimum Obsidian version, e.g. `"1.0.1": "1.0.0"`.
+1. Set the new version in `manifest.json` and `package.json`, and add it to `versions.json` mapped to the minimum Obsidian version, e.g. `"1.0.2": "1.0.0"`.
 2. Commit, then push a tag that is exactly that version, with no `v` prefix:
 
    ```bash
-   git tag 1.0.1
-   git push origin 1.0.1
+   git tag -a 1.0.2 -m "Elias HiveMind 1.0.2"
+   git push origin 1.0.2
    ```
 
-3. The **Release** workflow (`.github/workflows/release.yml`) runs typecheck, build, tests and packaging. It fails if the tag doesn't match `manifest.json`, and otherwise publishes a GitHub release with `main.js`, `manifest.json`, `styles.css` and the zip attached.
+3. The **Release** workflow (`.github/workflows/release.yml`) runs typecheck, build, tests and packaging, and fails if the tag doesn't match `manifest.json`. It then creates build provenance attestations for `main.js`, `manifest.json` and `styles.css`, and publishes a GitHub release with those three files and generated release notes. The verified zip is kept as a workflow artifact, not a release asset.
 
 `npm test` runs `test/run-tests.js`, which loads the **built bundle** with a stubbed Obsidian API and exercises every command: local and backend summaries, fallback on refused connections, timeouts and HTTP errors, tag normalisation and frontmatter merging, link suggestions, model listing for both request formats, and settings persistence. Run `npm run build` before `npm test`.
 
