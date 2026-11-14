@@ -2,6 +2,8 @@
 
 Summaries, tag suggestions and link suggestions for Obsidian, working offline by default and using a local Ollama model when you want one.
 
+New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language steps from install to your first Backlog Digest.
+
 - **Plugin id:** `elias-hivemind`
 - **Version:** 1.2.0
 - **Minimum Obsidian version:** 1.0.0
