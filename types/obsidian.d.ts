@@ -55,6 +55,8 @@ declare module 'obsidian' {
     cachedRead(file: TFile): Promise<string>;
     modify(file: TFile, data: string): Promise<void>;
     create(path: string, data: string): Promise<TFile>;
+    createFolder(path: string): Promise<TFolder>;
+    rename(file: TAbstractFile, newPath: string): Promise<void>;
   }
 
   /* -------------------------------------------------------------- metadata */
@@ -76,11 +78,17 @@ declare module 'obsidian' {
     level: number;
   }
 
+  export interface TagCache {
+    tag: string;
+    position: unknown;
+  }
+
   export interface CachedMetadata {
     links?: LinkCache[];
     embeds?: LinkCache[];
     headings?: HeadingCache[];
     frontmatter?: FrontMatterCache;
+    tags?: TagCache[];
   }
 
   export class MetadataCache {

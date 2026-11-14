@@ -26,6 +26,15 @@
  *       results into a single digest note. A backend variant would mean one
  *       model call per note in the set, so the digest stays offline.
  *
+ *   Backlog digest
+ *     - local only: scans the folders where saved clippings pile up, and
+ *       writes a "Your backlog" section into the same digest note - per item
+ *       a short summary, suggested tags, read time and age, bucketed by
+ *       relevance to the user's recent notes. It never deletes anything,
+ *       and never moves or marks a note without an explicit command run on
+ *       that note. An optional backend pass can add cross-item themes, but
+ *       only when the user switches it on.
+ *
  * Obsidian loads this file as CommonJS and instantiates the default export.
  */
 
@@ -68,6 +77,11 @@ interface EliasHiveMindSettings {
   maxLinkSuggestions: number;
   minTitleLength: number;
   ignoreFolders: string;
+  backlogFolders: string;
+  backlogTags: string;
+  backlogStaleDays: number;
+  backlogArchiveFolder: string;
+  backlogThemesViaBackend: boolean;
 }
 
 const DEFAULT_SETTINGS: EliasHiveMindSettings = {
@@ -90,6 +104,11 @@ const DEFAULT_SETTINGS: EliasHiveMindSettings = {
   maxLinkSuggestions: 20,
   minTitleLength: 4,
   ignoreFolders: '.trash, templates',
+  backlogFolders: 'Clippings, Inbox',
+  backlogTags: '',
+  backlogStaleDays: 30,
+  backlogArchiveFolder: 'Archive',
+  backlogThemesViaBackend: false,
 };
 
 /* ========================================================================== */
@@ -780,6 +799,462 @@ function upsertDigestSection(existing: string, section: string, date: string): s
 }
 
 /* ========================================================================== */
+/*                              backlog digest                                */
+/* ========================================================================== */
+
+/**
+ * Frontmatter key the plugin writes when the user marks a clipping read with
+ * the dedicated command. Obsidian has no read state of its own; this marker
+ * is the backlog's, it is only ever written by that explicit command, and a
+ * marked clipping drops out of later digests.
+ */
+const BACKLOG_READ_KEY = 'hivemind-read';
+
+/**
+ * Upper bound on unread clippings digested in one run, for the same reason
+ * as the weekly digest's cap: an unbounded first run over a 500-clipping
+ * pile would be slow (doubly so on a phone) and unreadable. The overflow is
+ * counted in the section, and because a run takes the most recently saved
+ * first, repeated runs chew through the pile.
+ */
+const BACKLOG_MAX_ITEMS = 50;
+
+/** A clipping with fewer readable words than this is a stub, not a read. */
+const BACKLOG_NEAR_EMPTY_WORDS = 25;
+
+/** Significant-word overlap (Jaccard) at which two clippings are the same article twice. */
+const BACKLOG_DUPLICATE_JACCARD = 0.6;
+
+/** Relevance score at which a clipping counts as tied to the user's current work. */
+const BACKLOG_RELEVANCE_THRESHOLD = 4;
+
+/** Word count at which a clipping counts as a substantial, keepable read. */
+const BACKLOG_REFERENCE_WORDS = 400;
+
+/** Distinct significant words at which a shorter clipping still counts as dense. */
+const BACKLOG_REFERENCE_UNIQUE = 80;
+
+const BACKLOG_DAY_MS = 24 * 60 * 60 * 1000;
+
+/** Reading speed behind the read-time estimate, in words per minute. */
+const WORDS_PER_MINUTE = 200;
+
+type BacklogBucket = 'now' | 'reference' | 'stale' | 'junk';
+
+/** Display order: act first, keep second, archive candidates, then junk. */
+const BACKLOG_BUCKET_ORDER: BacklogBucket[] = ['now', 'reference', 'stale', 'junk'];
+
+const BACKLOG_BUCKET_HEADINGS: Record<BacklogBucket, string> = {
+  now: 'Worth reading now',
+  reference: 'Reference',
+  stale: 'Gone stale',
+  junk: 'Junk candidates',
+};
+
+interface BacklogItem {
+  basename: string;
+  path: string;
+  summary: string;
+  tags: string[];
+  readMinutes: number;
+  ageDays: number;
+  wordCount: number;
+  relevance: number;
+  bucket: BacklogBucket;
+  reasons: string[];
+  /** The recent note this clipping most belongs with, when it mentions one. */
+  belongsTo: LinkSuggestion | null;
+}
+
+interface BacklogScan {
+  items: BacklogItem[];
+  /** Unread clippings left unscanned because the per-run cap was reached. */
+  omitted: number;
+  /** Clippings skipped because they already carry the read marker. */
+  readCount: number;
+  foldersLabel: string;
+  /** Cross-item themes from the optional backend pass; '' when not run. */
+  themes: string;
+}
+
+interface BacklogFacts {
+  wordCount: number;
+  uniqueWords: number;
+  ageDays: number;
+  staleDays: number;
+  relevance: number;
+  relevanceReasons: string[];
+  duplicateOf: string | null;
+  neverModified: boolean;
+}
+
+/** Backlog folders use the same comma-separated shape as Ignore folders. */
+function parseBacklogFolders(raw: string): string[] {
+  return parseIgnoreFolders(raw);
+}
+
+/** The configured folder names as the user typed them, for display. */
+function backlogFolderLabel(raw: string): string {
+  const names = raw
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  return names.length > 0 ? names.join(', ') : DEFAULT_SETTINGS.backlogFolders;
+}
+
+function parseBacklogTags(raw: string): string[] {
+  const out: string[] = [];
+  for (const part of String(raw ?? '').split(',')) {
+    const tag = normaliseTag(part);
+    if (tag && !out.includes(tag)) out.push(tag);
+  }
+  return out;
+}
+
+/**
+ * Every tag on a file, from the metadata cache only (frontmatter tags and
+ * inline #tags) — no file read, so backlog selection stays cheap.
+ */
+function fileTags(app: App, file: TFile): string[] {
+  const cache = app.metadataCache.getFileCache(file);
+  if (!cache) return [];
+  const out: string[] = [];
+  const push = (value: unknown): void => {
+    const tag = normaliseTag(String(value ?? ''));
+    if (tag && !out.includes(tag)) out.push(tag);
+  };
+  const frontmatter = cache.frontmatter as Record<string, unknown> | undefined;
+  if (frontmatter && frontmatter.tags != null) {
+    const raw = Array.isArray(frontmatter.tags) ? frontmatter.tags : [frontmatter.tags];
+    for (const value of raw) push(value);
+  }
+  for (const entry of cache.tags ?? []) push(entry?.tag);
+  return out;
+}
+
+/** True when `path` sits inside one of the (lowercased) folders. */
+function fileInAnyFolder(path: string, folders: string[]): boolean {
+  const lower = path.toLowerCase();
+  return folders.some((folder) => lower.startsWith(folder + '/'));
+}
+
+function countWords(plain: string): number {
+  return plain.split(/\s+/).filter((w) => w.length > 0).length;
+}
+
+function estimateReadMinutes(wordCount: number): number {
+  return Math.max(1, Math.round(wordCount / WORDS_PER_MINUTE));
+}
+
+/** The content words of a text: four-plus letters, no stopwords. */
+function significantWordSet(plain: string): Set<string> {
+  const set = new Set<string>();
+  for (const word of tokenize(plain)) {
+    if (word.length >= 4 && !STOPWORDS.has(word)) set.add(word);
+  }
+  return set;
+}
+
+/** Jaccard similarity of two word sets: shared words over all words. */
+function jaccardSimilarity(a: Set<string>, b: Set<string>): number {
+  let shared = 0;
+  a.forEach((w) => {
+    if (b.has(w)) shared += 1;
+  });
+  const union = a.size + b.size - shared;
+  return union === 0 ? 0 : shared / union;
+}
+
+/**
+ * Buckets one clipping. The rules run in a fixed order and each returns its
+ * reason in plain words, so the digest can say *why* an item sits where it
+ * sits; the same facts always produce the same bucket.
+ */
+function classifyBacklogItem(facts: BacklogFacts): { bucket: BacklogBucket; reasons: string[] } {
+  if (facts.wordCount < BACKLOG_NEAR_EMPTY_WORDS) {
+    return {
+      bucket: 'junk',
+      reasons: [`Near-empty — only ${facts.wordCount} words of readable text.`],
+    };
+  }
+
+  if (facts.duplicateOf) {
+    return {
+      bucket: 'junk',
+      reasons: [`Near-duplicate of [[${facts.duplicateOf}]] — the same significant words.`],
+    };
+  }
+
+  if (facts.relevance >= BACKLOG_RELEVANCE_THRESHOLD) {
+    return { bucket: 'now', reasons: facts.relevanceReasons };
+  }
+
+  if (facts.ageDays <= 7) {
+    const when =
+      facts.ageDays === 0 ? 'today' : facts.ageDays === 1 ? 'yesterday' : `${facts.ageDays} days ago`;
+    return { bucket: 'now', reasons: [`Saved ${when} — still fresh.`] };
+  }
+
+  if (facts.wordCount >= BACKLOG_REFERENCE_WORDS || facts.uniqueWords >= BACKLOG_REFERENCE_UNIQUE) {
+    return {
+      bucket: 'reference',
+      reasons: [
+        `Substantial, self-contained read (${facts.wordCount} words) — keeps its value as reference.`,
+      ],
+    };
+  }
+
+  if (facts.ageDays >= facts.staleDays && facts.neverModified) {
+    return {
+      bucket: 'stale',
+      reasons: [
+        `Saved ${facts.ageDays} days ago, untouched since, and no overlap with your recent work — an archive candidate.`,
+      ],
+    };
+  }
+
+  return { bucket: 'reference', reasons: ['No strong signal either way — kept as reference.'] };
+}
+
+/** Within a bucket: most actionable first, then path order for stability. */
+function compareBacklogItems(a: BacklogItem, b: BacklogItem): number {
+  const rank = BACKLOG_BUCKET_ORDER.indexOf(a.bucket) - BACKLOG_BUCKET_ORDER.indexOf(b.bucket);
+  if (rank !== 0) return rank;
+
+  let within = 0;
+  if (a.bucket === 'now') within = b.relevance - a.relevance || a.ageDays - b.ageDays;
+  else if (a.bucket === 'reference') within = b.wordCount - a.wordCount;
+  else within = b.ageDays - a.ageDays;
+
+  return within || a.path.localeCompare(b.path);
+}
+
+function formatSavedAgo(ageDays: number): string {
+  if (ageDays === 0) return 'saved today';
+  if (ageDays === 1) return 'saved yesterday';
+  return `saved ${ageDays} days ago`;
+}
+
+/** Assembles the "Your backlog" block, without a trailing newline. */
+function buildBacklogBlock(scan: BacklogScan): string {
+  const lines: string[] = ['### Your backlog', ''];
+
+  if (scan.items.length === 0 && scan.omitted === 0) {
+    lines.push(`No unread clippings waiting in ${scan.foldersLabel}.`);
+    if (scan.readCount > 0) {
+      lines.push('', `${scan.readCount} clipping${scan.readCount === 1 ? '' : 's'} already marked read.`);
+    }
+    return lines.join('\n');
+  }
+
+  const total = scan.items.length + scan.omitted;
+  lines.push(`${total} unread clipping${total === 1 ? '' : 's'} in ${scan.foldersLabel}.`);
+
+  const counts = BACKLOG_BUCKET_ORDER.map((bucket) => {
+    const n = scan.items.filter((item) => item.bucket === bucket).length;
+    return n > 0 ? `${n} ${BACKLOG_BUCKET_HEADINGS[bucket].toLowerCase()}` : '';
+  }).filter((s) => s.length > 0);
+  if (counts.length > 0) lines.push(counts.join(' · ') + '.');
+
+  if (scan.omitted > 0) {
+    lines.push(
+      `Digested the ${scan.items.length} most recently saved; ${scan.omitted} more wait for the next run (one run covers at most ${BACKLOG_MAX_ITEMS}).`
+    );
+  }
+  if (scan.readCount > 0) {
+    lines.push(`${scan.readCount} already marked read, skipped.`);
+  }
+
+  lines.push(
+    '',
+    '*Summaries are extractive — each article\'s own key sentences, picked on this device. ' +
+      'Nothing left the vault.*'
+  );
+
+  // The return-visit hook: one clear place to start, and a visible way to
+  // shrink the pile today, so the section earns its place in the digest.
+  const topPick = scan.items.find((item) => item.bucket === 'now');
+  if (topPick) {
+    lines.push(
+      '',
+      `**Start here:** [[${topPick.basename}]] — ${topPick.reasons[0] ?? 'Closest to your recent work.'}`
+    );
+  }
+  const clearable = scan.items.filter(
+    (item) => item.bucket === 'stale' || item.bucket === 'junk'
+  ).length;
+  if (clearable > 0) {
+    lines.push(
+      '',
+      `${clearable} item${clearable === 1 ? '' : 's'} could leave the pile today — open one and ` +
+        'archive it or mark it read, and this section shrinks on the next run.'
+    );
+  }
+
+  for (const bucket of BACKLOG_BUCKET_ORDER) {
+    const items = scan.items.filter((item) => item.bucket === bucket);
+    if (items.length === 0) continue;
+
+    lines.push('', `#### ${BACKLOG_BUCKET_HEADINGS[bucket]}`);
+
+    for (const item of items) {
+      lines.push(
+        '',
+        `- [[${item.basename}]] — ${item.readMinutes} min read · ${formatSavedAgo(item.ageDays)}`
+      );
+      lines.push(`  ${item.summary ? item.summary : '*No summarisable text in this note.*'}`);
+      const meta: string[] = [];
+      if (item.tags.length > 0) meta.push(`Tags: ${item.tags.map((t) => `#${t}`).join(' ')}`);
+      meta.push(`Why here: ${item.reasons.join(' ')}`);
+      lines.push(`  ${meta.join(' · ')}`);
+      if (item.belongsTo) {
+        lines.push(`  Belongs with: ${wikilinkFor(item.belongsTo)}`);
+      }
+    }
+  }
+
+  if (scan.themes) {
+    lines.push('', '#### Themes across your backlog', '', scan.themes);
+  }
+
+  lines.push(
+    '',
+    '*To process an item, open it and run a Backlog command from the command palette: ' +
+      'apply suggested tags, link it, mark as read, or archive. Nothing is deleted or moved automatically.*'
+  );
+
+  return lines.join('\n');
+}
+
+/**
+ * Returns the note text with the backlog block for `date` inserted or
+ * replaced. The block lives inside that date's weekly digest section: if
+ * the section already holds a backlog block it is swapped in place, if the
+ * section exists without one the block is appended to it, and if there is
+ * no section for the date yet one is created holding only the block. Other
+ * days' sections and the week's own entries are never touched.
+ */
+function upsertBacklogBlock(existing: string, block: string, date: string): string {
+  const heading = `## Weekly Digest — ${date}`;
+  const start = existing.indexOf(heading);
+
+  if (start === -1) {
+    return upsertDigestSection(existing, `${heading}\n\n${block}`, date);
+  }
+
+  const rest = existing.slice(start + heading.length);
+  const nextSection = rest.indexOf('\n## ');
+  const sectionEnd =
+    nextSection === -1 ? existing.length : start + heading.length + nextSection + 1;
+  const section = existing.slice(start, sectionEnd);
+
+  const marker = '### Your backlog';
+  const blockStart = section.indexOf(marker);
+  let newSection: string;
+
+  if (blockStart === -1) {
+    newSection = `${section.replace(/\n+$/, '')}\n\n${block}\n`;
+  } else {
+    const after = section.slice(blockStart + marker.length);
+    const nextSub = after.search(/\n#{2,3} /);
+    const blockEnd =
+      nextSub === -1 ? section.length : blockStart + marker.length + nextSub + 1;
+    newSection =
+      blockEnd < section.length
+        ? `${section.slice(0, blockStart)}${block}\n\n${section.slice(blockEnd)}`
+        : `${section.slice(0, blockStart)}${block}\n`;
+  }
+
+  return existing.slice(0, start) + newSection + existing.slice(sectionEnd);
+}
+
+/** Reads one `key: value` line out of a note's frontmatter, or null. */
+function frontmatterValue(markdown: string, key: string): string | null {
+  const block = frontmatterBlock(markdown);
+  if (!block) return null;
+
+  for (const line of block.lines) {
+    const match = new RegExp(`^${key}\\s*:\\s*(.*)$`).exec(line);
+    if (match) return match[1].trim().replace(/^['"]|['"]$/g, '');
+  }
+  return null;
+}
+
+/** True when the note carries the backlog read marker. */
+function isMarkedRead(markdown: string): boolean {
+  const value = frontmatterValue(markdown, BACKLOG_READ_KEY);
+  return value !== null && /^(true|yes)$/i.test(value);
+}
+
+/**
+ * Returns the note's current frontmatter text and its replacement with
+ * `key: value` set - the same head-splice shape as the tag merge, so the
+ * body is never rewritten.
+ */
+function withFrontmatterValue(
+  markdown: string,
+  key: string,
+  value: string
+): { oldHead: string; newHead: string } {
+  const eol = markdown.includes('\r\n') ? '\r\n' : '\n';
+  const block = frontmatterBlock(markdown);
+  const lines = block ? block.lines.slice() : [];
+
+  const line = `${key}: ${value}`;
+  const index = lines.findIndex((l) => new RegExp(`^${key}\\s*:`).test(l));
+  if (index >= 0) lines[index] = line;
+  else lines.push(line);
+
+  return { oldHead: block ? block.text : '', newHead: ['---', ...lines, '---'].join(eol) + eol };
+}
+
+/**
+ * Locates an existing summary block in a note: the line carrying the
+ * configured summary heading, plus everything up to the next heading or the
+ * end of the note. Returns character offsets, or null when there is no such
+ * block (including when the heading setting is blank - with no heading there
+ * is nothing recognisable to replace).
+ */
+function findSummaryBlock(text: string, heading: string): { start: number; end: number } | null {
+  const target = heading.trim();
+  if (!target) return null;
+
+  const lines = text.split('\n');
+  let offset = 0;
+
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trim() === target) {
+      let end = text.length;
+      let cursor = offset + lines[i].length + 1;
+      for (let j = i + 1; j < lines.length; j++) {
+        if (/^#{1,6}\s/.test(lines[j])) {
+          end = cursor;
+          break;
+        }
+        cursor += lines[j].length + 1;
+      }
+      return { start: offset, end };
+    }
+    offset += lines[i].length + 1;
+  }
+
+  return null;
+}
+
+/** Converts a character offset in `text` to an editor line/character position. */
+function offsetToPos(text: string, offset: number): { line: number; ch: number } {
+  let line = 0;
+  let lineStart = 0;
+  for (let i = 0; i < offset && i < text.length; i++) {
+    if (text[i] === '\n') {
+      line += 1;
+      lineStart = i + 1;
+    }
+  }
+  return { line, ch: offset - lineStart };
+}
+
+/* ========================================================================== */
 /*                                   modal                                    */
 /* ========================================================================== */
 
@@ -942,6 +1417,46 @@ export default class EliasHiveMindPlugin extends Plugin {
     });
 
     this.addCommand({
+      id: 'backlog-digest',
+      name: 'Backlog digest',
+      callback: () => {
+        void this.runBacklogDigest();
+      },
+    });
+
+    this.addCommand({
+      id: 'backlog-apply-tags',
+      name: 'Backlog: apply suggested tags to current note',
+      callback: () => {
+        void this.runBacklogApplyTags();
+      },
+    });
+
+    this.addCommand({
+      id: 'backlog-mark-read',
+      name: 'Backlog: mark current note as read',
+      callback: () => {
+        void this.runBacklogMarkRead();
+      },
+    });
+
+    this.addCommand({
+      id: 'backlog-archive',
+      name: 'Backlog: archive current note',
+      callback: () => {
+        void this.runBacklogArchive();
+      },
+    });
+
+    this.addCommand({
+      id: 'backlog-link',
+      name: 'Backlog: link current note to the notes it mentions',
+      callback: () => {
+        void this.runBacklogLink();
+      },
+    });
+
+    this.addCommand({
       id: 'test-backend-connection',
       name: 'Test backend connection',
       callback: () => {
@@ -1030,6 +1545,24 @@ export default class EliasHiveMindPlugin extends Plugin {
   private insertSummary(editor: Editor, summary: string): void {
     const heading = this.settings.summaryHeading.trim();
     const block = heading ? `${heading}\n${summary}\n` : `${summary}\n`;
+
+    // Re-running Summarize on a note that already carries a summary under
+    // the configured heading replaces that block where it sits - the same
+    // replace-rather-than-duplicate rule the weekly digest applies to its
+    // dated sections - instead of stacking a second summary section.
+    if (heading) {
+      const text = editor.getValue();
+      const existing = findSummaryBlock(text, heading);
+      if (existing) {
+        const replacement = existing.end < text.length ? `${block}\n` : block;
+        editor.replaceRange(
+          replacement,
+          offsetToPos(text, existing.start),
+          offsetToPos(text, existing.end)
+        );
+        return;
+      }
+    }
 
     if (this.settings.insertMode === 'top') {
       editor.replaceRange(`${block}\n`, { line: 0, ch: 0 });
@@ -1219,12 +1752,32 @@ export default class EliasHiveMindPlugin extends Plugin {
         week.length - shown.length
       );
 
+      // The dated section also carries the standing backlog section. The
+      // section replacement below wipes any earlier backlog block for
+      // today, so the fresh scan is upserted into the result before the
+      // single write. A backlog failure must not cost the weekly digest
+      // itself, so it is guarded separately.
+      let backlogBlock: string | null = null;
+      try {
+        backlogBlock = buildBacklogBlock(await this.collectBacklog(now));
+      } catch (backlogError) {
+        console.error('Elias HiveMind backlog section error', backlogError);
+      }
+      const withBacklog = (text: string): string =>
+        backlogBlock ? upsertBacklogBlock(text, backlogBlock, date) : text;
+
       const existing = this.app.vault.getAbstractFileByPath(DIGEST_NOTE_PATH);
       if (existing) {
         const current = await this.app.vault.read(existing as TFile);
-        await this.app.vault.modify(existing as TFile, upsertDigestSection(current, section, date));
+        await this.app.vault.modify(
+          existing as TFile,
+          withBacklog(upsertDigestSection(current, section, date))
+        );
       } else {
-        await this.app.vault.create(DIGEST_NOTE_PATH, upsertDigestSection('', section, date));
+        await this.app.vault.create(
+          DIGEST_NOTE_PATH,
+          withBacklog(upsertDigestSection('', section, date))
+        );
       }
 
       new Notice(
@@ -1236,6 +1789,417 @@ export default class EliasHiveMindPlugin extends Plugin {
     } finally {
       pending.hide();
     }
+  }
+
+  /* -------------------------------------------------------------- backlog */
+
+  /**
+   * Scans the configured backlog folders and classifies every unread
+   * clipping found. Bounded by design: at most BACKLOG_MAX_ITEMS unread
+   * items are read and processed per run (the rest are counted), and the
+   * recent-notes corpus behind the relevance score is capped the same way
+   * the weekly digest caps its week.
+   */
+  private async collectBacklog(now: Date): Promise<BacklogScan> {
+    const settings = this.settings;
+    const folders = parseBacklogFolders(settings.backlogFolders);
+    const tagSet = new Set(parseBacklogTags(settings.backlogTags));
+    const scan: BacklogScan = {
+      items: [],
+      omitted: 0,
+      readCount: 0,
+      foldersLabel: backlogFolderLabel(settings.backlogFolders),
+      themes: '',
+    };
+    if (tagSet.size > 0) {
+      scan.foldersLabel += `, or tagged ${Array.from(tagSet)
+        .map((t) => `#${t}`)
+        .join(', ')}`;
+    }
+    if (folders.length === 0 && tagSet.size === 0) return scan;
+
+    // The same exclusions as everywhere else - configuration folder and the
+    // user's ignored folders - plus the archive folder: archived clippings
+    // have been processed, wherever the archive lives.
+    const ignored = parseIgnoreFolders(`${this.app.vault.configDir}, ${settings.ignoreFolders}`);
+    const archive = settings.backlogArchiveFolder
+      .trim()
+      .replace(/^\/+|\/+$/g, '')
+      .toLowerCase();
+    const isExcluded = (file: TFile): boolean => {
+      const lower = file.path.toLowerCase();
+      return (
+        file.path === DIGEST_NOTE_PATH ||
+        ignored.some((folder) => lower.startsWith(folder + '/')) ||
+        (archive !== '' && (lower === archive || lower.startsWith(archive + '/')))
+      );
+    };
+
+    const all = this.app.vault.getMarkdownFiles();
+    const candidates = all
+      .filter(
+        (file) =>
+          !isExcluded(file) &&
+          (fileInAnyFolder(file.path, folders) ||
+            (tagSet.size > 0 && fileTags(this.app, file).some((t) => tagSet.has(t))))
+      )
+      .sort((a, b) => b.stat.ctime - a.stat.ctime);
+    const candidatePaths = new Set(candidates.map((f) => f.path));
+
+    // The user's current work: notes touched inside the digest window that
+    // are not themselves backlog candidates. Its vocabulary and the notes
+    // it links to are what a clipping can be relevant *to*.
+    const cutoff = now.getTime() - DIGEST_WINDOW_MS;
+    const recent = all
+      .filter(
+        (file) =>
+          !isExcluded(file) &&
+          !candidatePaths.has(file.path) &&
+          (file.stat.ctime >= cutoff || file.stat.mtime >= cutoff)
+      )
+      .sort((a, b) => b.stat.mtime - a.stat.mtime)
+      .slice(0, DIGEST_MAX_NOTES);
+    const recentPaths = new Set(recent.map((f) => f.path));
+
+    // The recent notes' working vocabulary: significant words they use at
+    // least twice between them.
+    const corpusFreq = new Map<string, number>();
+    for (const file of recent) {
+      for (const word of tokenize(toPlainText(await this.app.vault.cachedRead(file)))) {
+        if (word.length < 4 || STOPWORDS.has(word)) continue;
+        corpusFreq.set(word, (corpusFreq.get(word) ?? 0) + 1);
+      }
+    }
+    const corpus = new Set(
+      Array.from(corpusFreq.keys()).filter((word) => (corpusFreq.get(word) ?? 0) >= 2)
+    );
+
+    const seenWordSets: Array<{ basename: string; words: Set<string> }> = [];
+
+    for (const file of candidates) {
+      // Read clippings are skipped from the metadata cache where possible,
+      // so a large already-processed pile costs no file reads at all.
+      const cache = this.app.metadataCache.getFileCache(file);
+      const cached = cache?.frontmatter ? cache.frontmatter[BACKLOG_READ_KEY] : undefined;
+      if (cached === true || cached === 'true') {
+        scan.readCount += 1;
+        continue;
+      }
+
+      if (scan.items.length >= BACKLOG_MAX_ITEMS) {
+        scan.omitted += 1;
+        continue;
+      }
+
+      const markdown = await this.app.vault.cachedRead(file);
+      if (isMarkedRead(markdown)) {
+        scan.readCount += 1;
+        continue;
+      }
+
+      const plain = toPlainText(markdown);
+      const wordCount = countWords(plain);
+      const words = significantWordSet(plain);
+
+      let duplicateOf: string | null = null;
+      if (words.size >= 8) {
+        for (const seen of seenWordSets) {
+          if (
+            seen.words.size >= 8 &&
+            jaccardSimilarity(words, seen.words) >= BACKLOG_DUPLICATE_JACCARD
+          ) {
+            duplicateOf = seen.basename;
+            break;
+          }
+        }
+      }
+      seenWordSets.push({ basename: file.basename, words });
+
+      // Relevance from the plugin's own machinery: unlinked mentions of
+      // notes in the recent set (the link suggester, filtered to that set)
+      // plus vocabulary shared with those notes.
+      const mentions = findLinkSuggestions(this.app, file, markdown, settings).filter(
+        (suggestion) => recentPaths.has(suggestion.path)
+      );
+      const mentionCount = Math.min(
+        5,
+        mentions.reduce((n, s) => n + s.occurrences, 0)
+      );
+      let overlap = 0;
+      words.forEach((word) => {
+        if (corpus.has(word)) overlap += 1;
+      });
+      overlap = Math.min(overlap, 10);
+      const relevance = mentionCount * 2 + overlap;
+
+      const relevanceReasons: string[] = [];
+      if (mentions.length > 0) {
+        const top = mentions[0];
+        relevanceReasons.push(
+          mentions.length > 1
+            ? `Mentions ${wikilinkFor(top)} and ${mentions.length - 1} more of this week's notes without linking them.`
+            : `Mentions ${wikilinkFor(top)} without linking it.`
+        );
+      }
+      if (overlap > 0) {
+        relevanceReasons.push(
+          `Shares ${overlap} significant word${overlap === 1 ? '' : 's'} with your recent notes.`
+        );
+      }
+
+      const created = file.stat.ctime > 0 ? file.stat.ctime : file.stat.mtime;
+      const ageDays = Math.max(0, Math.floor((now.getTime() - created) / BACKLOG_DAY_MS));
+      const { bucket, reasons } = classifyBacklogItem({
+        wordCount,
+        uniqueWords: words.size,
+        ageDays,
+        staleDays: settings.backlogStaleDays,
+        relevance,
+        relevanceReasons,
+        duplicateOf,
+        neverModified: file.stat.mtime - created < BACKLOG_DAY_MS,
+      });
+
+      scan.items.push({
+        basename: file.basename,
+        path: file.path,
+        summary: summariseLocally(markdown, Math.min(3, settings.summarySentenceCount)),
+        tags: suggestTagsLocally(markdown, settings.maxTags, existingFrontmatterTags(markdown)),
+        readMinutes: estimateReadMinutes(wordCount),
+        ageDays,
+        wordCount,
+        relevance,
+        bucket,
+        reasons,
+        belongsTo: mentions.length > 0 ? mentions[0] : null,
+      });
+    }
+
+    scan.items.sort(compareBacklogItems);
+
+    // Optional, opt-in: a backend pass that groups the pile into themes.
+    // Best-effort only - any failure leaves the fully local digest standing,
+    // and with the toggle off (the default) no request is made at all.
+    if (settings.backlogThemesViaBackend && scan.items.length >= 2) {
+      try {
+        const list = scan.items
+          .map((item) => `- ${item.basename}: ${item.summary ? item.summary : '(no summary)'}`)
+          .join('\n');
+        const prompt =
+          'The following are summaries of articles saved to read later. Group them into ' +
+          'a few themes. Return only markdown bullet lines of the form ' +
+          '"- Theme: the article titles that belong to it", with no preamble.\n\n' +
+          list;
+        scan.themes = (await generateViaBackend(settings, prompt)).trim();
+      } catch (error) {
+        console.error('Elias HiveMind backlog themes error', error);
+        scan.themes = '';
+      }
+    }
+
+    return scan;
+  }
+
+  /** Standalone run: refreshes the backlog block in the digest note. */
+  private async runBacklogDigest(): Promise<void> {
+    const now = new Date();
+    const pending = new Notice('Elias HiveMind: digesting your backlog...', 0);
+    try {
+      const scan = await this.collectBacklog(now);
+
+      if (scan.items.length === 0 && scan.omitted === 0) {
+        new Notice(
+          scan.readCount > 0
+            ? `Elias HiveMind: backlog clear — ${scan.readCount} clipping${scan.readCount === 1 ? '' : 's'} already marked read in ${scan.foldersLabel}. Nothing written.`
+            : `Elias HiveMind: no unread clippings in ${scan.foldersLabel}. Nothing written.`
+        );
+        return;
+      }
+
+      const date = formatDigestDate(now);
+      const block = buildBacklogBlock(scan);
+      const existing = this.app.vault.getAbstractFileByPath(DIGEST_NOTE_PATH);
+      if (existing) {
+        const current = await this.app.vault.read(existing as TFile);
+        await this.app.vault.modify(existing as TFile, upsertBacklogBlock(current, block, date));
+      } else {
+        await this.app.vault.create(DIGEST_NOTE_PATH, upsertBacklogBlock('', block, date));
+      }
+
+      new Notice(
+        `Elias HiveMind: backlog digest updated in "${DIGEST_NOTE_PATH}" — ${scan.items.length} unread clipping${scan.items.length === 1 ? '' : 's'}.`
+      );
+    } catch (error) {
+      console.error('Elias HiveMind backlog digest error', error);
+      new Notice(`Elias HiveMind: backlog digest failed. ${describeError(error)}`, 10000);
+    } finally {
+      pending.hide();
+    }
+  }
+
+  /**
+   * The note the Backlog processing commands act on: the active file, when
+   * it sits in a backlog folder. Anything else gets an explanation instead
+   * of an action - these commands never touch notes outside the backlog.
+   */
+  private backlogActiveFile(): TFile | null {
+    const file = this.app.workspace.getActiveFile();
+    if (!file) {
+      new Notice('Elias HiveMind: no active note.');
+      return null;
+    }
+    const inFolder = fileInAnyFolder(
+      file.path,
+      parseBacklogFolders(this.settings.backlogFolders)
+    );
+    const tagSet = new Set(parseBacklogTags(this.settings.backlogTags));
+    const tagged = tagSet.size > 0 && fileTags(this.app, file).some((t) => tagSet.has(t));
+    if (!inFolder && !tagged) {
+      new Notice(
+        `Elias HiveMind: "${file.basename}" is not in the backlog (${backlogFolderLabel(this.settings.backlogFolders)}).`
+      );
+      return null;
+    }
+    return file;
+  }
+
+  /** Applies the local tag suggestions to the open clipping, via the usual checklist. */
+  private async runBacklogApplyTags(): Promise<void> {
+    const file = this.backlogActiveFile();
+    if (!file) return;
+
+    const markdown = await this.app.vault.read(file);
+    const tags = suggestTagsLocally(
+      markdown,
+      this.settings.maxTags,
+      existingFrontmatterTags(markdown)
+    );
+    if (tags.length === 0) {
+      new Notice('Elias HiveMind: no new tags found for this clipping.');
+      return;
+    }
+
+    new ChoiceModal(this.app, {
+      title: 'Suggested tags',
+      intro: `${tags.length} tag${tags.length === 1 ? '' : 's'} suggested locally for "${file.basename}".`,
+      confirmText: 'Add selected tags',
+      items: tags,
+      label: (tag) => `#${tag}`,
+      onSubmit: (chosen) => {
+        if (chosen.length === 0) return;
+        void (async () => {
+          try {
+            // Re-read at apply time: the note may have changed since the
+            // checklist opened. Only the frontmatter head is spliced.
+            const current = await this.app.vault.read(file);
+            const { oldHead, newHead } = mergeTagsIntoFrontmatter(current, chosen);
+            await this.app.vault.modify(file, newHead + current.slice(oldHead.length));
+            new Notice(
+              `Elias HiveMind: added ${chosen.length} tag${chosen.length === 1 ? '' : 's'}.`
+            );
+          } catch (error) {
+            console.error('Elias HiveMind backlog tag error', error);
+            new Notice(`Elias HiveMind: adding tags failed. ${describeError(error)}`, 10000);
+          }
+        })();
+      },
+    }).open();
+  }
+
+  /** Writes the read marker into the open clipping's frontmatter. */
+  private async runBacklogMarkRead(): Promise<void> {
+    const file = this.backlogActiveFile();
+    if (!file) return;
+
+    const markdown = await this.app.vault.read(file);
+    if (isMarkedRead(markdown)) {
+      new Notice(`Elias HiveMind: "${file.basename}" is already marked read.`);
+      return;
+    }
+
+    const { oldHead, newHead } = withFrontmatterValue(markdown, BACKLOG_READ_KEY, 'true');
+    await this.app.vault.modify(file, newHead + markdown.slice(oldHead.length));
+    new Notice(
+      `Elias HiveMind: marked "${file.basename}" as read. It drops out of the backlog digest.`
+    );
+  }
+
+  /**
+   * Moves the open clipping into the archive folder. This is the plugin's
+   * only move, it runs only from this explicit command, and it refuses -
+   * rather than overwriting - when a note of the same name is archived
+   * already. Nothing in the plugin deletes, here or anywhere else.
+   */
+  private async runBacklogArchive(): Promise<void> {
+    const file = this.backlogActiveFile();
+    if (!file) return;
+
+    const folder = this.settings.backlogArchiveFolder.trim().replace(/^\/+|\/+$/g, '');
+    if (!folder) {
+      new Notice('Elias HiveMind: set an archive folder in settings first.');
+      return;
+    }
+    if (file.path.toLowerCase().startsWith(folder.toLowerCase() + '/')) {
+      new Notice(`Elias HiveMind: "${file.basename}" is already in ${folder}.`);
+      return;
+    }
+
+    const target = `${folder}/${file.name}`;
+    if (this.app.vault.getAbstractFileByPath(target)) {
+      new Notice(`Elias HiveMind: "${target}" already exists — "${file.basename}" was not moved.`);
+      return;
+    }
+
+    try {
+      if (!this.app.vault.getAbstractFileByPath(folder)) {
+        await this.app.vault.createFolder(folder);
+      }
+      await this.app.vault.rename(file, target);
+      new Notice(`Elias HiveMind: archived "${file.basename}" to ${folder}/.`);
+    } catch (error) {
+      console.error('Elias HiveMind backlog archive error', error);
+      new Notice(`Elias HiveMind: archive failed. ${describeError(error)}`, 10000);
+    }
+  }
+
+  /**
+   * The digest's "link" action: the same unlinked-mention suggestions as
+   * the editor command, appended to the open clipping under a
+   * "## Suggested links" heading once the user confirms the checklist.
+   */
+  private async runBacklogLink(): Promise<void> {
+    const file = this.backlogActiveFile();
+    if (!file) return;
+
+    const markdown = await this.app.vault.read(file);
+    const suggestions = findLinkSuggestions(this.app, file, markdown, this.settings);
+    if (suggestions.length === 0) {
+      new Notice('Elias HiveMind: no unlinked mentions found in this clipping.');
+      return;
+    }
+
+    new ChoiceModal(this.app, {
+      title: 'Suggested links',
+      intro: `${suggestions.length} note${
+        suggestions.length === 1 ? '' : 's'
+      } mentioned in this clipping but not yet linked.`,
+      confirmText: 'Insert selected',
+      items: suggestions,
+      label: (s) => s.title,
+      meta: (s) => `${s.occurrences}x${s.viaAlias ? ' (alias)' : ''}`,
+      onSubmit: (chosen) => {
+        if (chosen.length === 0) return;
+        const lines = chosen.map((s) => `- ${wikilinkFor(s)}`).join('\n');
+        const block = `\n\n## Suggested links\n${lines}\n`;
+        void (async () => {
+          const current = await this.app.vault.read(file);
+          await this.app.vault.modify(file, current + block);
+          new Notice(
+            `Elias HiveMind: inserted ${chosen.length} link${chosen.length === 1 ? '' : 's'}.`
+          );
+        })();
+      },
+    }).open();
   }
 
   /* ------------------------------------------------------------ diagnostic */
@@ -1547,6 +2511,71 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
             void this.plugin.saveSettings();
           })
       );
+
+    new Setting(containerEl).setName('Backlog').setHeading();
+
+    new Setting(containerEl)
+      .setName('Backlog folders')
+      .setDesc('Comma-separated folder paths the backlog digest scans - where saved clippings pile up.')
+      .addText((text) =>
+        text
+          .setPlaceholder('Clippings, Inbox')
+          .setValue(this.plugin.settings.backlogFolders)
+          .onChange((value) => {
+            this.plugin.settings.backlogFolders = value;
+            void this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Backlog tags')
+      .setDesc('Comma-separated tags - notes carrying any of these tags count as backlog too, wherever they live. Leave empty to scan folders only.')
+      .addText((text) =>
+        text
+          .setPlaceholder('to-read')
+          .setValue(this.plugin.settings.backlogTags)
+          .onChange((value) => {
+            this.plugin.settings.backlogTags = value;
+            void this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Stale after (days)')
+      .setDesc('A clipping untouched for this many days, with no overlap with your recent notes, is listed as gone stale.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(7, 180, 1)
+          .setValue(this.plugin.settings.backlogStaleDays)
+          .setDynamicTooltip()
+          .onChange((value) => {
+            this.plugin.settings.backlogStaleDays = value;
+            void this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Archive folder')
+      .setDesc('Folder the "Backlog: archive current note" command moves a clipping into. Archiving never deletes anything.')
+      .addText((text) =>
+        text
+          .setPlaceholder('Archive')
+          .setValue(this.plugin.settings.backlogArchiveFolder)
+          .onChange((value) => {
+            this.plugin.settings.backlogArchiveFolder = value;
+            void this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Backlog themes via backend')
+      .setDesc('When on, a backlog digest also asks your configured backend to group the clippings into themes. Off by default; the digest itself always works fully offline.')
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.backlogThemesViaBackend).onChange((value) => {
+          this.plugin.settings.backlogThemesViaBackend = value;
+          void this.plugin.saveSettings();
+        })
+      );
   }
 
   /** The configuration folder is user-renameable, so the hint is built at runtime. */
@@ -1759,6 +2788,63 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
               key: 'ignoreFolders',
               placeholder: this.ignoreFoldersPlaceholder(),
               defaultValue: DEFAULT_SETTINGS.ignoreFolders,
+            },
+          },
+        ],
+      },
+      {
+        type: 'group',
+        heading: 'Backlog',
+        items: [
+          {
+            name: 'Backlog folders',
+            desc: 'Comma-separated folder paths the backlog digest scans - where saved clippings pile up.',
+            control: {
+              type: 'text',
+              key: 'backlogFolders',
+              placeholder: 'Clippings, Inbox',
+              defaultValue: DEFAULT_SETTINGS.backlogFolders,
+            },
+          },
+          {
+            name: 'Backlog tags',
+            desc: 'Comma-separated tags - notes carrying any of these tags count as backlog too, wherever they live. Leave empty to scan folders only.',
+            control: {
+              type: 'text',
+              key: 'backlogTags',
+              placeholder: 'to-read',
+              defaultValue: DEFAULT_SETTINGS.backlogTags,
+            },
+          },
+          {
+            name: 'Stale after (days)',
+            desc: 'A clipping untouched for this many days, with no overlap with your recent notes, is listed as gone stale.',
+            control: {
+              type: 'slider',
+              key: 'backlogStaleDays',
+              min: 7,
+              max: 180,
+              step: 1,
+              defaultValue: DEFAULT_SETTINGS.backlogStaleDays,
+            },
+          },
+          {
+            name: 'Archive folder',
+            desc: 'Folder the "Backlog: archive current note" command moves a clipping into. Archiving never deletes anything.',
+            control: {
+              type: 'text',
+              key: 'backlogArchiveFolder',
+              placeholder: 'Archive',
+              defaultValue: DEFAULT_SETTINGS.backlogArchiveFolder,
+            },
+          },
+          {
+            name: 'Backlog themes via backend',
+            desc: 'When on, a backlog digest also asks your configured backend to group the clippings into themes. Off by default; the digest itself always works fully offline.',
+            control: {
+              type: 'toggle',
+              key: 'backlogThemesViaBackend',
+              defaultValue: DEFAULT_SETTINGS.backlogThemesViaBackend,
             },
           },
         ],

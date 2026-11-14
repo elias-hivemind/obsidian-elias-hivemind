@@ -3,6 +3,44 @@
 All notable changes to Elias HiveMind. Versions match `manifest.json`; each
 release is cut from the tag of the same name (no `v` prefix).
 
+## 1.2.0
+
+- **New: Backlog digest.** A new command, **Backlog digest**, scans the
+  folders where saved clippings pile up (settings: *Backlog folders*,
+  default `Clippings, Inbox`) — plus any note carrying one of the
+  *Backlog tags*, wherever it lives — and writes a **Your backlog** section into
+  `Weekly Digest.md`; the weekly digest carries the same section as a
+  standing part of each dated entry, so the pile shrinks weekly. Per
+  clipping: a short local summary, suggested tags, read time and age,
+  bucketed by relevance to your recent notes — *Worth reading now*
+  (mentions or vocabulary shared with this week's notes, or just saved),
+  *Reference* (substantial, evergreen), *Gone stale* (untouched past the
+  *Stale after (days)* setting, default 30) and *Junk candidates*
+  (near-empty or near-duplicate). Every bucket states its reason. At most
+  50 unread clippings are digested per run, most recently saved first; the
+  rest are counted for the next run. Clippings already in the archive
+  folder, the configuration folder and ignored folders are excluded.
+- **Processing commands for clippings** (each acts only on the note you run
+  it on, and only when that note is in the backlog): **Backlog: apply
+  suggested tags to current note**, **Backlog: link current note to the
+  notes it mentions** (the usual unlinked-mention checklist, appended under
+  a `## Suggested links` heading), **Backlog: mark current note as read**
+  (writes a `hivemind-read: true` frontmatter marker, after which the
+  clipping drops out of digests) and **Backlog: archive current note**
+  (moves it into the *Archive folder*, default `Archive`, creating the
+  folder if needed and refusing rather than overwriting a same-named
+  note). The plugin never deletes anything, and nothing is moved or marked
+  without one of these explicit commands.
+- **Optional backlog themes:** with *Backlog themes via backend* on (off
+  by default), a digest run also asks your configured backend to group the
+  clippings into themes. The core digest needs no model and no network,
+  and works on mobile exactly as on desktop.
+- **Fixed:** running a Summarize command on a note that already has a
+  summary under the configured heading now replaces that summary in place
+  instead of stacking a second `## Summary` section. (A note whose summary
+  heading setting has since been changed keeps the old section; only the
+  current heading is recognised.)
+
 ## 1.1.0
 
 - **New command: Weekly digest (local).** Collects the notes created or

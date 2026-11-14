@@ -3,7 +3,7 @@
 Summaries, tag suggestions and link suggestions for Obsidian, working offline by default and using a local Ollama model when you want one.
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.1.0
+- **Version:** 1.2.0
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -75,6 +75,21 @@ Collects every note created or modified in the last seven days and writes a date
 
 The digest is local only. A backend variant would mean one model call per note in the week, so it uses the local summarizer and stays fully offline.
 
+### Backlog digest
+
+Saved articles pile up in a clippings folder and are never read. The backlog digest scans the folders you configure (default: `Clippings` and `Inbox`, including their subfolders) — or, if you set *Backlog tags*, any note carrying one of those tags wherever it lives — and writes a **Your backlog** section into `Weekly Digest.md`. The section opens with a single **Start here** pick and says how many items could leave the pile today, so it earns a return visit each week:
+
+- The **Backlog digest** command refreshes that section on its own; the weekly digest also includes it as a standing part of each dated section, so the pile is reviewed weekly instead of growing daily.
+- Each clipping gets a short local summary (up to three sentences), suggested tags from the local tagger, an estimated read time, and its age. Nothing is sent anywhere; the scan reads clipping content only when you run a digest command.
+- Clippings are bucketed, and every bucket says why in plain words:
+  - **Worth reading now** — the clipping mentions one of this week's notes without linking it, or shares significant vocabulary with your recent notes; a clipping saved in the last seven days also lands here while it is fresh.
+  - **Reference** — a substantial, self-contained read (400+ words, or dense in distinct content words) that keeps its value, and anything with no stronger signal.
+  - **Gone stale** — untouched since it was saved, older than the *Stale after (days)* setting (default 30), and with no overlap with your recent work. These are archive candidates.
+  - **Junk candidates** — near-empty (under 25 words of readable text) or a near-duplicate of another clipping, judged by overlap of their significant words.
+- One run digests at most 50 unread clippings, most recently saved first, so a 500-clipping pile stays fast — including on a phone. The rest are counted in the section and picked up by the next run. Clippings in the archive folder, the configuration folder and ignored folders are excluded, and clippings you have marked read are skipped (the scan checks the metadata cache first, so a large already-read pile costs no file reads).
+- Processing is one explicit command per clipping, run while the clipping is open: **apply suggested tags** (the usual checklist, written to frontmatter), **link** (the usual unlinked-mention checklist, appended under a `## Suggested links` heading), **mark as read** (writes a `hivemind-read: true` frontmatter property; marked clippings drop out of later digests), or **archive** (moves the clipping into the archive folder, default `Archive`, creating it if needed and refusing rather than overwriting a same-named note). The digest itself only links to each clipping — opening the link is the tap. **The plugin never deletes anything, and never moves or marks a note on its own.**
+- Optionally, with *Backlog themes via backend* switched on, a digest run also asks your configured backend to group the clippings into cross-article themes. It is off by default and best-effort: if the backend is unreachable the local digest is written without themes.
+
 ---
 
 ## Privacy
@@ -82,6 +97,8 @@ The digest is local only. A backend variant would mean one model call per note i
 - **Local commands** (every command marked *local*, and *Suggest links for current note*) make no network requests.
 - **Suggest links for current note** reads the file list of the whole vault (the names, paths and aliases of your notes) to find mentions of them in the current note. It does this only when you run the command, and nothing it reads is stored or sent anywhere.
 - **Weekly digest (local)** reads the notes created or modified in the last seven days (their content, to summarize them), only when you run the command. The only thing it writes is the digest note, inside your vault.
+- **Backlog digest** reads the clippings in your backlog folders or carrying a backlog tag (their content, to summarize and classify them) and the notes you touched in the last seven days (to judge relevance), only when you run a digest command. Tag-based selection reads only the metadata cache's tag list, never file content. It writes only the digest note. The four **Backlog:** processing commands write or move only the one note you run them on — a tag merge, appended links, a `hivemind-read: true` frontmatter marker, or a move into your archive folder — and only when you run them.
+- **Backlog themes**, only if you switch *Backlog themes via backend* on, sends the clippings' titles and summaries (not their full text) to the **Backend URL** you configure — the same local server as the other backend commands. With the setting off, no backlog request is ever made.
 - **Backend commands** send the note's plain text, with frontmatter and code blocks removed, to the **Backend URL** you configure. The default is `http://127.0.0.1:11434/api/generate`, a local Ollama server, so the text doesn't leave your computer unless you change that URL.
 - **Opening the settings tab** sends one request to the same server for its list of installed models. No note content is included.
 - The plugin doesn't collect or send any usage data.
@@ -247,7 +264,14 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 | Suggest tags for current note (backend) | Backend URL | Asks the model for tags; you pick which to add to frontmatter. Falls back to local if enabled. |
 | Suggest links for current note | None | Lists notes mentioned but not linked; you pick which links to append. |
 | Weekly digest (local) | None | Summarizes the notes created or modified in the last seven days into `Weekly Digest.md`. |
+| Backlog digest | None¹ | Digests the unread clippings in your backlog folders (or carrying a backlog tag) into the "Your backlog" section of `Weekly Digest.md`: summary, tags, read time, age, bucketed by relevance. |
+| Backlog: apply suggested tags to current note | None | Suggests tags for the open clipping and merges the ones you pick into its frontmatter. Only on a backlog clipping. |
+| Backlog: link current note to the notes it mentions | None | Appends the unlinked mentions you pick to the open clipping under a `## Suggested links` heading. Only on a backlog clipping. |
+| Backlog: mark current note as read | None | Writes `hivemind-read: true` into the open clipping's frontmatter, so it drops out of later digests. Only on a backlog clipping. |
+| Backlog: archive current note | None | Moves the open clipping into your archive folder. Refuses rather than overwriting a same-named note. Only on a backlog clipping. |
 | Test backend connection | Backend URL | Sends a test sentence and shows the reply or the error. |
+
+¹ Unless *Backlog themes via backend* is on, in which case the clippings' titles and summaries are also sent to your Backend URL for the themes pass.
 
 ---
 
@@ -284,6 +308,16 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 | Maximum suggestions | `20` | Upper bound on unlinked mentions offered at once (5–100). |
 | Minimum title length | `4` | Titles and aliases shorter than this are ignored (2–15). |
 | Ignore folders | `.trash, templates` | Comma-separated folder paths excluded from link suggestions. The vault's configuration folder (`.obsidian` unless you renamed it) is always excluded, whether or not it is listed here. |
+
+### Backlog
+
+| Setting | Default | Description |
+|---|---|---|
+| Backlog folders | `Clippings, Inbox` | Comma-separated folder paths the backlog digest scans, including subfolders. |
+| Backlog tags | *(empty)* | Comma-separated tags — notes carrying any of them count as backlog too, wherever they live. Empty scans folders only. |
+| Stale after (days) | `30` | A clipping untouched for this many days (7–180), with no overlap with your recent notes, is listed as gone stale. |
+| Archive folder | `Archive` | Folder the *Backlog: archive current note* command moves a clipping into. Clippings already inside it are excluded from digests. |
+| Backlog themes via backend | Off | Also ask your backend to group each digest's clippings into themes. Best-effort; the digest itself never needs it. |
 
 ### Prompts (no settings-tab control)
 
@@ -339,7 +373,7 @@ npm run package     # zip main.js + manifest.json + styles.css into build/elias-
 
 3. The **Release** workflow (`.github/workflows/release.yml`) runs typecheck, build, tests and packaging, and fails if the tag doesn't match `manifest.json`. It then creates build provenance attestations for `main.js`, `manifest.json` and `styles.css`, and publishes a GitHub release with those three files and generated release notes. The verified zip is kept as a workflow artifact, not a release asset.
 
-`npm test` runs `test/run-tests.js`, which loads the **built bundle** with a stubbed Obsidian API and exercises every command: local and backend summaries, fallback on refused connections, timeouts and HTTP errors, tag normalisation and frontmatter merging, link suggestions, the weekly digest, model listing for both request formats, and settings persistence. A `pretest` script builds `dist/main.js` first, so `npm test` works on a fresh clone.
+`npm test` runs `test/run-tests.js`, which loads the **built bundle** with a stubbed Obsidian API and exercises every command: local and backend summaries, fallback on refused connections, timeouts and HTTP errors, tag normalisation and frontmatter merging, link suggestions, the weekly digest, the backlog digest and its processing commands, model listing for both request formats, and settings persistence. A `pretest` script builds `dist/main.js` first, so `npm test` works on a fresh clone.
 
 ### Project layout
 

@@ -318,6 +318,11 @@ async function main() {
     'generate-tags-backend',
     'suggest-links',
     'weekly-digest-local',
+    'backlog-digest',
+    'backlog-apply-tags',
+    'backlog-mark-read',
+    'backlog-archive',
+    'backlog-link',
     'test-backend-connection',
   ];
   expected.forEach((id) => check('registered command: ' + id, ids.includes(id), 'got: ' + ids.join(', ')));
@@ -587,14 +592,15 @@ async function main() {
   console.log('\n[10f] declarative settings definitions (Obsidian 1.13.0+)');
   const defs = tab.getSettingDefinitions();
   const groups = defs.map((d) => d.heading);
-  check('four groups, in display() order',
-    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Tags', 'Link suggestion']),
+  check('five groups, in display() order',
+    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Tags', 'Link suggestion', 'Backlog']),
     JSON.stringify(groups));
 
   const allItems = defs.flatMap((g) => g.items || []);
   const controlKeys = allItems.filter((i) => i.control).map((i) => i.control.key).sort();
   const expectedKeys = [
-    'backendFormat', 'backendTimeoutMs', 'backendUrl', 'fallbackToLocal',
+    'backendFormat', 'backendTimeoutMs', 'backendUrl', 'backlogArchiveFolder',
+    'backlogFolders', 'backlogStaleDays', 'backlogTags', 'backlogThemesViaBackend', 'fallbackToLocal',
     'ignoreFolders', 'insertMode', 'maxLinkSuggestions', 'maxTags',
     'minTitleLength', 'summaryHeading', 'summarySentenceCount',
   ];
@@ -805,6 +811,504 @@ async function main() {
   check('the count line still reports the whole week',
     capText.includes('55 notes created or modified since ' + fmtDate(nowMs - 7 * DAY)), capText.slice(0, 300));
   check('the 51st note is not listed', !capText.includes('### [[Cap Note 51]]'));
+
+  console.log('\n[14] backlog settings defaults');
+  check('backlog folders default to Clippings, Inbox', plugin.settings.backlogFolders === 'Clippings, Inbox');
+  check('backlog stale default is 30 days', plugin.settings.backlogStaleDays === 30);
+  check('backlog archive folder default is Archive', plugin.settings.backlogArchiveFolder === 'Archive');
+  check('backlog themes are off by default', plugin.settings.backlogThemesViaBackend === false);
+  check('backlog tags default to empty (folders only)', plugin.settings.backlogTags === '');
+
+  console.log('\n[15] backlog digest: scan scope, buckets, per-item assembly');
+  function makeBacklogRig(files, contents, caches, digestContent, activePath) {
+    const store = { created: null, modified: null, renamed: [], folders: [] };
+    const digestFile = digestContent == null
+      ? null
+      : mkStatFile('Weekly Digest', nowMs - DAY, nowMs - 1000);
+    const all = digestFile ? files.concat([digestFile]) : files;
+    const rigApp = {
+      vault: {
+        configDir: '.hivecfg',
+        getName: () => 'BacklogVault',
+        getMarkdownFiles: () => all,
+        getFiles: () => all,
+        getAbstractFileByPath: (p) => {
+          if (store.folders.includes(p)) return { path: p, name: p };
+          return all.find((f) => f.path === p) || null;
+        },
+        read: async (f) => contents[f.path] ?? '',
+        cachedRead: async (f) => contents[f.path] ?? '',
+        create: async (p, data) => { store.created = { path: p, data }; contents[p] = data; return mkStatFile('Weekly Digest', nowMs, nowMs); },
+        modify: async (f, data) => { store.modified = { path: f.path, data }; contents[f.path] = data; },
+        createFolder: async (p) => { store.folders.push(p); return { path: p, name: p }; },
+        rename: async (f, newPath) => { store.renamed.push([f.path, newPath]); },
+      },
+      workspace: {
+        getActiveFile: () => all.find((f) => f.path === activePath) || null,
+        getActiveViewOfType: () => null,
+      },
+      metadataCache: {
+        resolvedLinks: {}, unresolvedLinks: {},
+        getFileCache: (f) => (caches && caches[f.path]) || null,
+        getFirstLinkpathDest: () => null,
+      },
+    };
+    return { app: rigApp, store };
+  }
+
+  async function runBacklog(rig, settings) {
+    const p = new PluginClass(rig.app, manifest);
+    await p.onload();
+    if (settings) Object.assign(p.settings, settings);
+    NOTICES.length = 0;
+    p._commands.find((c) => c.id === 'backlog-digest').callback();
+    await flushMany();
+    return p;
+  }
+
+  const atlasText = [
+    '# Project Atlas', '',
+    'Project Atlas tracks the garden compost schedule carefully.',
+    'The compost schedule guides every garden planting decision this season.',
+    'Garden beds follow the compost schedule without exception.',
+  ].join('\n');
+  const workshopText = [
+    '# Workshop Log', '',
+    'The workshop log records tool repairs and timber orders.',
+    'Timber orders arrive before the workshop weekend build session.',
+  ].join('\n');
+  const relevantText = [
+    '# Composting Questions Answered', '',
+    'Project Atlas already lays out how our compost schedule should work this spring.',
+    'The article explains how a compost pile heats up when greens and browns are layered properly.',
+    'Turning the pile every week keeps air moving through the material as it breaks down.',
+    'Project Atlas lists the garden beds that receive finished compost first.',
+    'Moisture matters as much as temperature when the pile is breaking down slowly.',
+    'A dry pile stalls while a soaked pile turns slimy and smells unpleasant.',
+    'The finished compost feeds the garden beds before planting begins again.',
+  ].join('\n');
+  const freshText = [
+    '# Star Party Notes', '',
+    'The astronomy club meets on the hill above town when skies stay clear.',
+    'Telescopes come out after sunset and the first stars appear over the ridge.',
+    'Jupiter and Saturn are both visible this month through small telescopes.',
+    'Bring warm layers because the hill gets cold once the wind picks up after midnight.',
+  ].join('\n');
+  const ventPara = [
+    'Hydrothermal vents form where seawater seeps into cracks in the ocean floor and is heated by magma below.',
+    'The superheated water rises through chimneys of deposited minerals, carrying dissolved metals and sulphur compounds into the cold deep ocean.',
+    'Around these black smokers, entire ecosystems thrive without sunlight, built on bacteria that harvest chemical energy from the vent fluids.',
+    'Giant tube worms, eyeless shrimp and pale crabs cluster near the warm shimmering water, grazing on microbial mats.',
+    'Scientists study vent fields to understand how life might begin on other worlds, where subsurface oceans may hide similar chemistry beneath ice.',
+  ].join(' ');
+  const deepText = '# Vent Fields\n\n' + [ventPara, ventPara, ventPara, ventPara, ventPara, ventPara].join('\n\n');
+  const staleText = [
+    '# Handset Review Roundup', '',
+    'The flagship handset ships with a brighter display and a noticeably larger battery this year.',
+    'Reviewers praised the camera in low light and the faster chip during long gaming sessions.',
+    'Battery tests lasted through a full day of heavy use with charge to spare by evening.',
+    'The manufacturer promises four years of software updates for every model in the range.',
+    'Prices climb again though, and the charger is no longer included in the box.',
+    'Preorders open Friday with trade-in bonuses for older devices in good condition.',
+  ].join('\n');
+  const dupText = [
+    '# Sourdough Starter Guide', '',
+    'A healthy sourdough starter bubbles vigorously and smells pleasantly tangy after feeding.',
+    'Feed the starter equal parts flour and water by weight every twelve hours at room temperature.',
+    'Whole grain flour gives the wild yeast and bacteria more minerals to feed on during fermentation.',
+    'The starter should double in size within six hours when it is ready to leaven bread dough.',
+    'Cold storage in the refrigerator slows fermentation and stretches the feeding schedule to weekly.',
+    'Discard half the starter before each feeding so acidity stays balanced and growth stays strong.',
+    'Bakers track hydration carefully because dough behaviour changes with small shifts in water content.',
+    'A mature starter can live for decades when it is fed regularly and kept reasonably clean.',
+  ].join('\n');
+
+  const backlogFiles = [
+    mkStatFile('Project Atlas', nowMs - DAY, nowMs - DAY),
+    mkStatFile('Workshop Log', nowMs - 2 * DAY, nowMs - 2 * DAY),
+    mkStatFile('Relevant Clip', nowMs - 3 * DAY, nowMs - 3 * DAY, 'Clippings'),
+    mkStatFile('Quick Save', nowMs - DAY, nowMs - DAY, 'Inbox/Deep'),
+    mkStatFile('Deep Reference', nowMs - 90 * DAY, nowMs - 90 * DAY, 'Clippings'),
+    mkStatFile('Old News', nowMs - 45 * DAY, nowMs - 45 * DAY, 'Clippings'),
+    mkStatFile('Tiny Save', nowMs - 20 * DAY, nowMs - 20 * DAY, 'Inbox'),
+    mkStatFile('Dup One', nowMs - 25 * DAY, nowMs - 25 * DAY, 'Clippings'),
+    mkStatFile('Dup Two', nowMs - 24 * DAY, nowMs - 24 * DAY, 'Clippings'),
+    mkStatFile('Already Read', nowMs - 10 * DAY, nowMs - 10 * DAY, 'Clippings'),
+    mkStatFile('Cached Read', nowMs - 11 * DAY, nowMs - 11 * DAY, 'Inbox'),
+    mkStatFile('Old Archived', nowMs - 12 * DAY, nowMs - 12 * DAY, 'Archive'),
+    mkStatFile('Stray Clip', nowMs - 2 * DAY, nowMs - 2 * DAY, 'Downloads'),
+  ];
+  const backlogContents = {
+    'Project Atlas.md': atlasText,
+    'Workshop Log.md': workshopText,
+    'Clippings/Relevant Clip.md': relevantText,
+    'Inbox/Deep/Quick Save.md': freshText,
+    'Clippings/Deep Reference.md': deepText,
+    'Clippings/Old News.md': staleText,
+    'Inbox/Tiny Save.md': 'Saved link. Check later.',
+    'Clippings/Dup One.md': dupText,
+    'Clippings/Dup Two.md': dupText,
+    'Clippings/Already Read.md': '---\nhivemind-read: true\n---\n# Already Read\n\nTidal pools and shoreline ecology notes with plenty of ordinary prose about tides and rock pools.',
+    'Inbox/Cached Read.md': '# Cached Read\n\nGreenhouse ventilation notes with plenty of ordinary prose about airflow and shading.',
+    'Archive/Old Archived.md': staleText,
+    'Downloads/Stray Clip.md': staleText,
+  };
+  const backlogCaches = { 'Inbox/Cached Read.md': { frontmatter: { 'hivemind-read': true } } };
+
+  const backlogRig = makeBacklogRig(backlogFiles, backlogContents, backlogCaches, null);
+  await runBacklog(backlogRig);
+  check('backlog digest note created', backlogRig.store.created && backlogRig.store.created.path === 'Weekly Digest.md');
+  const block = backlogRig.store.created ? backlogRig.store.created.data : '';
+  check('block opens the standing backlog section inside a dated digest section',
+    block.includes('## Weekly Digest — ' + todayStr) && block.includes('### Your backlog'), block.slice(0, 200));
+  check('header counts only unarchived, unread clippings in the configured folders',
+    block.includes('7 unread clippings in Clippings, Inbox.'), block.slice(0, 400));
+  check('read clippings (marker in content and in metadata cache) are skipped and counted',
+    block.includes('2 already marked read, skipped.') && !block.includes('[[Already Read]]') && !block.includes('[[Cached Read]]'), block.slice(0, 400));
+  check('archive folder and non-backlog folders are out of scope',
+    !block.includes('[[Old Archived]]') && !block.includes('[[Stray Clip]]'));
+  check('bucket count line summarises all four buckets',
+    block.includes('2 worth reading now · 2 reference · 1 gone stale · 2 junk candidates'), block.slice(0, 500));
+  const iNow = block.indexOf('#### Worth reading now');
+  const iRef = block.indexOf('#### Reference');
+  const iStale = block.indexOf('#### Gone stale');
+  const iJunk = block.indexOf('#### Junk candidates');
+  check('buckets are ordered now, reference, stale, junk',
+    iNow !== -1 && iNow < iRef && iRef < iStale && iStale < iJunk);
+  check('relevant clip lands in Worth reading now with its mention as the reason',
+    block.indexOf('[[Relevant Clip]]', iNow) > iNow && block.indexOf('[[Relevant Clip]]', iNow) < iRef &&
+    block.includes('Mentions [[Project Atlas]]'), block.slice(iNow, iRef));
+  check('retention hook: the section opens with a single Start here pick',
+    block.includes('**Start here:** [[Relevant Clip]]'), block.slice(0, 700));
+  check('retention hook: the stale and junk pile is offered as clearable today',
+    block.includes('could leave the pile today'), block.slice(0, 700));
+  check('the section is honest that summaries are extractive and local',
+    block.includes('Summaries are extractive'), block.slice(0, 700));
+  check('relevant clip offers its note as where it belongs',
+    block.includes('Belongs with: [[Project Atlas]]'));
+  check('per-item assembly: wikilink, read time, age, tags',
+    block.includes('- [[Relevant Clip]] — 1 min read · saved 3 days ago') && block.includes('#compost'),
+    block.slice(iNow, iRef));
+  check('fresh clip is Worth reading now because it was just saved',
+    block.indexOf('[[Quick Save]]') > iNow && block.indexOf('[[Quick Save]]') < iRef &&
+    block.includes('Saved yesterday — still fresh.'), block.slice(iNow, iRef));
+  check('deep old article is Reference, not stale (evergreen beats age)',
+    block.indexOf('[[Deep Reference]]') > iRef && block.indexOf('[[Deep Reference]]') < iStale &&
+    block.includes('Substantial, self-contained read'), block.slice(iRef, iStale));
+  check('read time scales with length (deep reference is a 3 min read)',
+    block.includes('- [[Deep Reference]] — 3 min read · saved 90 days ago'));
+  check('old untouched low-overlap clip is Gone stale with the reason stated',
+    block.indexOf('[[Old News]]') > iStale && block.indexOf('[[Old News]]') < iJunk &&
+    block.includes('untouched since'), block.slice(iStale, iJunk));
+  check('near-empty clip is Junk with its word count as the reason',
+    block.indexOf('[[Tiny Save]]') > iJunk && block.includes('Near-empty — only 4 words'), block.slice(iJunk));
+  check('the second copy of a duplicated article is Junk, the first is kept as Reference',
+    block.indexOf('[[Dup One]]') > iJunk && block.includes('Near-duplicate of [[Dup Two]]') &&
+    block.indexOf('[[Dup Two]]') > iRef && block.indexOf('[[Dup Two]]') < iStale &&
+    block.includes('No strong signal either way'), block.slice(iJunk));
+  check('success notice fired', NOTICES.some((n) => n.includes('backlog digest updated')), NOTICES.join(' | '));
+  check('invariant: a digest run renames and deletes nothing',
+    backlogRig.store.renamed.length === 0 && backlogRig.store.folders.length === 0);
+  check('invariant: the only write is the digest note itself',
+    backlogRig.store.modified === null && backlogContents['Clippings/Relevant Clip.md'] === relevantText);
+
+  console.log('\n[15b] backlog digest: empty backlog writes nothing');
+  const emptyBacklogRig = makeBacklogRig(
+    [mkStatFile('Project Atlas', nowMs - DAY, nowMs - DAY)],
+    { 'Project Atlas.md': atlasText },
+    null,
+    null
+  );
+  await runBacklog(emptyBacklogRig);
+  check('empty backlog produced the no-clippings notice',
+    NOTICES.some((n) => n.includes('no unread clippings in Clippings, Inbox')), NOTICES.join(' | '));
+  check('empty backlog created and modified nothing',
+    emptyBacklogRig.store.created === null && emptyBacklogRig.store.modified === null);
+
+  console.log('\n[15c] backlog digest: everything already read writes nothing');
+  const allReadRig = makeBacklogRig(
+    [mkStatFile('Already Read', nowMs - 10 * DAY, nowMs - 10 * DAY, 'Clippings')],
+    { 'Clippings/Already Read.md': backlogContents['Clippings/Already Read.md'] },
+    null,
+    null
+  );
+  await runBacklog(allReadRig);
+  check('all-read backlog produced the clear notice',
+    NOTICES.some((n) => n.includes('backlog clear')), NOTICES.join(' | '));
+  check('all-read backlog wrote nothing', allReadRig.store.created === null && allReadRig.store.modified === null);
+
+  console.log('\n[16] backlog digest: the per-run cap is bounded and stated');
+  const capClipFiles = [];
+  const capClipContents = {};
+  for (let i = 1; i <= 55; i += 1) {
+    const base = 'Cap Clip ' + String(i).padStart(2, '0');
+    capClipFiles.push(mkStatFile(base, nowMs - i * 3600000, nowMs - i * 3600000, 'Clippings'));
+    capClipContents['Clippings/' + base + '.md'] =
+      'Cap clip ' + i + ' discusses topic' + i + ' and subject' + i + ' with enough ordinary prose around them ' +
+      'to pass the near empty threshold comfortably today. It was saved from a long article page earlier ' +
+      'this week for later reading and review purposes.';
+  }
+  const capBacklogRig = makeBacklogRig(capClipFiles, capClipContents, null, null);
+  await runBacklog(capBacklogRig);
+  const capBlock = capBacklogRig.store.created ? capBacklogRig.store.created.data : '';
+  check('header reports the whole pile', capBlock.includes('55 unread clippings in Clippings, Inbox.'), capBlock.slice(0, 300));
+  check('exactly 50 clippings are digested', (capBlock.match(/- \[\[/g) || []).length === 50,
+    'items: ' + (capBlock.match(/- \[\[/g) || []).length);
+  check('the overflow is counted for the next run',
+    capBlock.includes('Digested the 50 most recently saved; 5 more wait for the next run'), capBlock.slice(0, 400));
+  check('the most recently saved are digested first',
+    capBlock.includes('[[Cap Clip 01]]') && !capBlock.includes('[[Cap Clip 55]]'));
+
+  console.log('\n[17] backlog section rides inside the weekly digest, and merges without duplicating');
+  const weeklyClip = mkStatFile('Weekly Clip', nowMs - 40 * DAY, nowMs - 40 * DAY, 'Clippings');
+  const weeklyClipText = staleText.replace('Handset Review Roundup', 'Tablet Review Roundup');
+  const rideRig = makeDigestRig(
+    weekFiles.concat([weeklyClip]),
+    Object.assign({}, weekContents, { 'Clippings/Weekly Clip.md': weeklyClipText }),
+    null
+  );
+  await runDigest(rideRig);
+  const rideText = rideRig.store.created ? rideRig.store.created.data : '';
+  check('weekly digest carries the standing backlog section',
+    rideText.includes('### Your backlog') && rideText.includes('[[Weekly Clip]]'), rideText.slice(-600));
+  check('the backlog item is bucketed inside the weekly section',
+    rideText.indexOf('[[Weekly Clip]]') > rideText.indexOf('#### Gone stale'), rideText.slice(-600));
+
+  const mergeContents = {
+    'Alpha Harvest.md': alphaText,
+    'Clippings/Weekly Clip.md': weeklyClipText,
+    'Weekly Digest.md': rideText,
+  };
+  const mergeRig = makeBacklogRig(
+    [weekFiles[0], weeklyClip],
+    mergeContents,
+    null,
+    rideText
+  );
+  await runBacklog(mergeRig);
+  const merged = mergeRig.store.modified ? mergeRig.store.modified.data : '';
+  check('standalone backlog run modifies the digest note in place', Boolean(mergeRig.store.modified) && mergeRig.store.created === null);
+  check('the backlog block is replaced, not duplicated',
+    merged.split('### Your backlog').length - 1 === 1, merged.slice(-500));
+  check("the week's own entries survive a backlog-only run",
+    merged.includes('### [[Alpha Harvest]]') && merged.includes('## Weekly Digest — ' + todayStr));
+
+  console.log('\n[18] backlog process actions: explicit, per-item, non-destructive (spec-named)');
+  async function runBacklogCommand(rig, commandId, settings) {
+    const p = new PluginClass(rig.app, manifest);
+    await p.onload();
+    if (settings) Object.assign(p.settings, settings);
+    NOTICES.length = 0;
+    p._commands.find((c) => c.id === commandId).callback();
+    await flushMany();
+    return p;
+  }
+  const actionContents = {
+    'Clippings/Action Clip.md': '# Action Clip\n\nThe body of this clipping must survive every process action untouched.',
+  };
+  const actionRig = makeBacklogRig(
+    [mkStatFile('Action Clip', nowMs - 5 * DAY, nowMs - 5 * DAY, 'Clippings')],
+    Object.assign({}, actionContents),
+    null,
+    null,
+    'Clippings/Action Clip.md'
+  );
+  await runBacklogCommand(actionRig, 'backlog-mark-read');
+  check('mark read writes the read marker into the clipping frontmatter',
+    actionRig.store.modified !== null &&
+    actionRig.store.modified.path === 'Clippings/Action Clip.md' &&
+    actionRig.store.modified.data.startsWith('---\nhivemind-read: true\n---'),
+    actionRig.store.modified ? actionRig.store.modified.data.slice(0, 120) : 'no modify');
+  check('mark read preserves the clipping body',
+    actionRig.store.modified !== null &&
+    actionRig.store.modified.data.includes('The body of this clipping must survive'));
+  check('mark read moves and deletes nothing',
+    actionRig.store.renamed.length === 0 && actionRig.store.folders.length === 0);
+  actionRig.store.created = null;
+  actionRig.store.modified = null;
+  await runBacklog(actionRig);
+  check('a marked clipping drops out of the next digest run',
+    NOTICES.some((n) => n.includes('backlog clear')) &&
+    actionRig.store.created === null && actionRig.store.modified === null,
+    NOTICES.join(' | '));
+
+  const outsideRig = makeBacklogRig(
+    [mkStatFile('Loose Note', nowMs - 5 * DAY, nowMs - 5 * DAY)],
+    { 'Loose Note.md': '# Loose Note\n\nNot a clipping at all.' },
+    null,
+    null,
+    'Loose Note.md'
+  );
+  await runBacklogCommand(outsideRig, 'backlog-mark-read');
+  check('process commands refuse notes outside the backlog',
+    NOTICES.some((n) => n.includes('is not in the backlog')) && outsideRig.store.modified === null,
+    NOTICES.join(' | '));
+
+  const archiveRig = makeBacklogRig(
+    [mkStatFile('Action Clip', nowMs - 5 * DAY, nowMs - 5 * DAY, 'Clippings')],
+    Object.assign({}, actionContents),
+    null,
+    null,
+    'Clippings/Action Clip.md'
+  );
+  await runBacklogCommand(archiveRig, 'backlog-archive');
+  check('archive moves the clipping into the archive folder, creating it first',
+    JSON.stringify(archiveRig.store.renamed) === JSON.stringify([['Clippings/Action Clip.md', 'Archive/Action Clip.md']]) &&
+    archiveRig.store.folders.includes('Archive'),
+    JSON.stringify(archiveRig.store.renamed));
+  check('archive reports itself in a notice', NOTICES.some((n) => n.includes('archived')), NOTICES.join(' | '));
+
+  const collisionRig = makeBacklogRig(
+    [
+      mkStatFile('Action Clip', nowMs - 5 * DAY, nowMs - 5 * DAY, 'Clippings'),
+      mkStatFile('Action Clip', nowMs - 50 * DAY, nowMs - 50 * DAY, 'Archive'),
+    ],
+    Object.assign({}, actionContents, { 'Archive/Action Clip.md': '# Older copy\n\nAlready archived long ago.' }),
+    null,
+    null,
+    'Clippings/Action Clip.md'
+  );
+  await runBacklogCommand(collisionRig, 'backlog-archive');
+  check('archive refuses to overwrite a same-named note',
+    collisionRig.store.renamed.length === 0 && NOTICES.some((n) => n.includes('already exists')),
+    NOTICES.join(' | '));
+
+  const tagActionRig = makeBacklogRig(
+    [mkStatFile('Garden Clip', nowMs - 2 * DAY, nowMs - 2 * DAY, 'Clippings')],
+    { 'Clippings/Garden Clip.md': '# Garden Notes\n\nGardens need water. Water the gardens daily. Gardens grow fast.' },
+    null,
+    null,
+    'Clippings/Garden Clip.md'
+  );
+  MODALS.length = 0;
+  await runBacklogCommand(tagActionRig, 'backlog-apply-tags');
+  check('apply tags opens the usual checklist modal', MODALS.length === 1, 'modals: ' + MODALS.length);
+  confirmLatestModal('Add selected tags');
+  await flushMany();
+  check('apply tags merges the suggested tag into the clipping frontmatter',
+    tagActionRig.store.modified !== null && tagActionRig.store.modified.data.includes('- gardens'),
+    tagActionRig.store.modified ? tagActionRig.store.modified.data.slice(0, 160) : 'no modify');
+  check('apply tags preserves the clipping body',
+    tagActionRig.store.modified !== null && tagActionRig.store.modified.data.includes('Gardens grow fast.'));
+
+  const linkRig = makeBacklogRig(
+    [
+      mkStatFile('Project Atlas', nowMs - DAY, nowMs - DAY),
+      mkStatFile('Link Clip', nowMs - 2 * DAY, nowMs - 2 * DAY, 'Clippings'),
+    ],
+    {
+      'Project Atlas.md': atlasText,
+      'Clippings/Link Clip.md': '# Link Clip\n\nProject Atlas guides the planting schedule this spring. Project Atlas lists the beds that get compost first.',
+    },
+    null,
+    null,
+    'Clippings/Link Clip.md'
+  );
+  MODALS.length = 0;
+  await runBacklogCommand(linkRig, 'backlog-link');
+  check('link opens the suggestion checklist for the clipping', MODALS.length === 1, 'modals: ' + MODALS.length);
+  confirmLatestModal('Insert selected');
+  await flushMany();
+  check('link appends the chosen notes under a Suggested links heading',
+    linkRig.store.modified !== null &&
+    linkRig.store.modified.data.includes('## Suggested links') &&
+    linkRig.store.modified.data.includes('- [[Project Atlas]]'),
+    linkRig.store.modified ? linkRig.store.modified.data.slice(-200) : 'no modify');
+
+  console.log('\n[19] backlog themes: opt-in backend pass, best-effort');
+  const themeFiles = [
+    mkStatFile('Project Atlas', nowMs - DAY, nowMs - DAY),
+    mkStatFile('Relevant Clip', nowMs - 3 * DAY, nowMs - 3 * DAY, 'Clippings'),
+    mkStatFile('Quick Save', nowMs - DAY, nowMs - DAY, 'Inbox/Deep'),
+  ];
+  const themeContents = {
+    'Project Atlas.md': atlasText,
+    'Clippings/Relevant Clip.md': relevantText,
+    'Inbox/Deep/Quick Save.md': freshText,
+  };
+  REQUEST_HANDLER = async () => ({
+    status: 200, headers: {}, text: '',
+    json: { response: '- Gardens: compost, beds and planting schedules' },
+  });
+  const themeRig = makeBacklogRig(themeFiles, Object.assign({}, themeContents), null, null);
+  await runBacklog(themeRig, { backlogThemesViaBackend: true });
+  const themeText = themeRig.store.created ? themeRig.store.created.data : '';
+  check('an opted-in backend adds a themes section to the backlog block',
+    themeText.includes('#### Themes across your backlog') && themeText.includes('Gardens: compost, beds'),
+    themeText.slice(-400));
+  REQUEST_HANDLER = async () => { throw new Error('connect ECONNREFUSED 127.0.0.1:11434'); };
+  const themeFailRig = makeBacklogRig(themeFiles, Object.assign({}, themeContents), null, null);
+  await runBacklog(themeFailRig, { backlogThemesViaBackend: true });
+  const themeFailText = themeFailRig.store.created ? themeFailRig.store.created.data : '';
+  check('a dead backend leaves the local digest standing, with no themes section',
+    themeFailText.includes('### Your backlog') && !themeFailText.includes('Themes across your backlog'),
+    themeFailText.slice(-300));
+  REQUEST_HANDLER = null;
+
+  console.log('\n[19b] offline / no-network path (spec-named): local digests make zero requests');
+  let requestCount = 0;
+  REQUEST_HANDLER = async () => { requestCount += 1; throw new Error('network must not be touched'); };
+  const offlineBacklogRig = makeBacklogRig(themeFiles, Object.assign({}, themeContents), null, null);
+  await runBacklog(offlineBacklogRig);
+  check('backlog digest completes with the network handler armed to fail',
+    offlineBacklogRig.store.created !== null && offlineBacklogRig.store.created.data.includes('### Your backlog'));
+  const offlineWeekRig = makeDigestRig(weekFiles, weekContents, null);
+  await runDigest(offlineWeekRig);
+  check('weekly digest (with its backlog section) completes offline too',
+    offlineWeekRig.store.created !== null && offlineWeekRig.store.created.data.includes('### Your backlog'));
+  check('zero network requests were made by either local digest', requestCount === 0, 'requests: ' + requestCount);
+  REQUEST_HANDLER = null;
+
+  console.log('\n[20] summarize re-run replaces the summary block instead of stacking it');
+  plugin.settings.summaryHeading = '## Summary';
+  plugin.settings.summarySentenceCount = 3;
+  const dupEd = new MockEditor(note);
+  await localCmd.editorCallback(dupEd, { file: activeFile });
+  await localCmd.editorCallback(dupEd, { file: activeFile });
+  check('two summarize runs leave exactly one summary heading',
+    (dupEd.text.match(/## Summary/g) || []).length === 1, dupEd.text.slice(0, 300));
+  check('the note title appears exactly once after re-summarising',
+    (dupEd.text.match(/# Pressure Notes/g) || []).length === 1);
+  plugin.settings.insertMode = 'bottom';
+  const dupBottomEd = new MockEditor(note);
+  await localCmd.editorCallback(dupBottomEd, { file: activeFile });
+  await localCmd.editorCallback(dupBottomEd, { file: activeFile });
+  check('bottom mode also replaces instead of stacking',
+    (dupBottomEd.text.match(/## Summary/g) || []).length === 1 &&
+    dupBottomEd.text.indexOf('## Summary') > dupBottomEd.text.indexOf('The vault stores durable memory'),
+    dupBottomEd.text.slice(-300));
+  plugin.settings.insertMode = 'top';
+
+  console.log('\n[21] backlog selection by tags, not just folders');
+  const tagSelRig = makeBacklogRig(
+    [
+      mkStatFile('Tagged Clip', nowMs - DAY, nowMs - DAY, 'Downloads'),
+      mkStatFile('Inline Clip', nowMs - DAY, nowMs - DAY, 'Downloads'),
+      mkStatFile('Other Clip', nowMs - DAY, nowMs - DAY, 'Downloads'),
+      mkStatFile('Folder Clip', nowMs - DAY, nowMs - DAY, 'Clippings'),
+    ],
+    {
+      'Downloads/Tagged Clip.md': '# Tagged Clip\n\nTagged clippings wait in the downloads folder until someone files them properly away.',
+      'Downloads/Inline Clip.md': '# Inline Clip\n\nAn inline tagged clipping about telescope mirrors and careful collimation steps.',
+      'Downloads/Other Clip.md': '# Other Clip\n\nThis clipping carries a different tag and stays out of the backlog entirely today.',
+      'Clippings/Folder Clip.md': '# Folder Clip\n\nA folder clipping about seed starting indoors under lights in late winter cold.',
+    },
+    {
+      'Downloads/Tagged Clip.md': { frontmatter: { tags: ['to-read'] } },
+      'Downloads/Inline Clip.md': { tags: [{ tag: '#someday' }] },
+      'Downloads/Other Clip.md': { frontmatter: { tags: ['later'] } },
+    },
+    null
+  );
+  await runBacklog(tagSelRig, { backlogTags: 'to-read, someday' });
+  const tagSelText = tagSelRig.store.created ? tagSelRig.store.created.data : '';
+  check('a frontmatter tag selects a clipping outside the backlog folders',
+    tagSelText.includes('[[Tagged Clip]]'), tagSelText.slice(0, 500));
+  check('an inline #tag selects a clipping too', tagSelText.includes('[[Inline Clip]]'));
+  check('folder selection still works alongside tags', tagSelText.includes('[[Folder Clip]]'));
+  check('a clipping with an unlisted tag stays out', !tagSelText.includes('[[Other Clip]]'));
+  check('the section header names the tag selection',
+    tagSelText.includes('or tagged #to-read, #someday'), tagSelText.slice(0, 300));
 
   console.log('\n' + '='.repeat(56));
   console.log('  PASSED: ' + passed + '   FAILED: ' + failed);
