@@ -20,6 +20,12 @@
  *     - scans the vault for notes whose title or alias appears verbatim in the
  *       current note but is not yet linked, and offers to insert wikilinks.
  *
+ *   Weekly digest
+ *     - local only: collects the notes created or modified in the last seven
+ *       days, summarises each with the local summariser, and writes the
+ *       results into a single digest note. A backend variant would mean one
+ *       model call per note in the set, so the digest stays offline.
+ *
  * Obsidian loads this file as CommonJS and instantiates the default export.
  */
 
@@ -678,6 +684,102 @@ function wikilinkFor(suggestion: LinkSuggestion): string {
 }
 
 /* ========================================================================== */
+/*                              weekly digest                                 */
+/* ========================================================================== */
+
+/** The single note every digest run writes to, at the vault root. */
+const DIGEST_NOTE_PATH = 'Weekly Digest.md';
+
+const DIGEST_WINDOW_MS = 7 * 24 * 60 * 60 * 1000;
+
+/**
+ * Upper bound on notes listed in one digest section. A very active week
+ * would otherwise produce an unreadable note (and a very long run); the
+ * overflow is counted in the section rather than silently dropped.
+ */
+const DIGEST_MAX_NOTES = 50;
+
+interface DigestEntry {
+  basename: string;
+  path: string;
+  summary: string;
+  links: LinkSuggestion[];
+}
+
+/** Local calendar date as YYYY-MM-DD (toISOString would shift it to UTC). */
+function formatDigestDate(date: Date): string {
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return `${date.getFullYear()}-${month}-${day}`;
+}
+
+/** Assembles one dated digest section, without a trailing newline. */
+function buildDigestSection(
+  date: string,
+  since: string,
+  entries: DigestEntry[],
+  tags: string[],
+  omitted: number
+): string {
+  const lines: string[] = [
+    `## Weekly Digest — ${date}`,
+    '',
+    `${entries.length + omitted} note${entries.length + omitted === 1 ? '' : 's'} created or modified since ${since}.`,
+  ];
+
+  for (const entry of entries) {
+    lines.push('', `### [[${entry.basename}]]`, '');
+    lines.push(entry.summary ? entry.summary : '*No summarisable text in this note.*');
+    if (entry.links.length > 0) {
+      lines.push('', `Links to this week's notes: ${entry.links.map(wikilinkFor).join(', ')}`);
+    }
+  }
+
+  if (omitted > 0) {
+    lines.push(
+      '',
+      `*…and ${omitted} more note${omitted === 1 ? '' : 's'} from this week, not shown (the digest lists at most ${DIGEST_MAX_NOTES}).*`
+    );
+  }
+
+  if (tags.length > 0) {
+    lines.push('', '### Suggested tags for this week', '', tags.map((t) => `#${t}`).join(' '));
+  }
+
+  return lines.join('\n');
+}
+
+/**
+ * Returns the digest note's new full text. A section for `date` that is
+ * already present is replaced (re-running the command the same day refreshes
+ * that day's digest instead of duplicating it); otherwise the new section
+ * goes directly under the note's `# Weekly Digest` title, or at the top of
+ * whatever the note already holds.
+ */
+function upsertDigestSection(existing: string, section: string, date: string): string {
+  const heading = `## Weekly Digest — ${date}`;
+  const start = existing.indexOf(heading);
+
+  if (start !== -1) {
+    const rest = existing.slice(start + heading.length);
+    const next = rest.indexOf('\n## ');
+    const after = next === -1 ? '' : rest.slice(next + 1);
+    const before = existing.slice(0, start);
+    return after ? `${before}${section}\n\n${after}` : `${before}${section}\n`;
+  }
+
+  if (!existing.trim()) return `# Weekly Digest\n\n${section}\n`;
+
+  const firstBreak = existing.indexOf('\n');
+  if (firstBreak !== -1 && existing.slice(0, firstBreak).trim() === '# Weekly Digest') {
+    const tail = existing.slice(firstBreak + 1).replace(/^\n+/, '');
+    return `# Weekly Digest\n\n${section}\n\n${tail}`;
+  }
+
+  return `${section}\n\n${existing}`;
+}
+
+/* ========================================================================== */
 /*                                   modal                                    */
 /* ========================================================================== */
 
@@ -828,6 +930,14 @@ export default class EliasHiveMindPlugin extends Plugin {
       name: 'Suggest links for current note',
       editorCallback: (editor: Editor, view: MarkdownView) => {
         void this.runLinkSuggestions(editor, view);
+      },
+    });
+
+    this.addCommand({
+      id: 'weekly-digest-local',
+      name: 'Weekly digest (local)',
+      callback: () => {
+        void this.runWeeklyDigest();
       },
     });
 
@@ -1046,6 +1156,86 @@ export default class EliasHiveMindPlugin extends Plugin {
         );
       },
     }).open();
+  }
+
+  /* -------------------------------------------------------------- digest */
+
+  private async runWeeklyDigest(): Promise<void> {
+    const now = new Date();
+    const cutoff = now.getTime() - DIGEST_WINDOW_MS;
+    // Same exclusions as link suggestion: the configuration folder plus
+    // whatever the user listed, and the digest note itself - its mtime
+    // changes on every run, so without the path check it would digest itself.
+    const ignored = parseIgnoreFolders(
+      `${this.app.vault.configDir}, ${this.settings.ignoreFolders}`
+    );
+
+    const week = this.app.vault
+      .getMarkdownFiles()
+      .filter(
+        (file) =>
+          file.path !== DIGEST_NOTE_PATH &&
+          (file.stat.ctime >= cutoff || file.stat.mtime >= cutoff) &&
+          !ignored.some((folder) => file.path.toLowerCase().startsWith(folder + '/'))
+      )
+      .sort((a, b) => b.stat.mtime - a.stat.mtime);
+
+    if (week.length === 0) {
+      new Notice('Elias HiveMind: no notes created or modified in the last 7 days. No digest written.');
+      return;
+    }
+
+    const shown = week.slice(0, DIGEST_MAX_NOTES);
+    const shownPaths = new Set(shown.map((file) => file.path));
+
+    const pending = new Notice('Elias HiveMind: building weekly digest...', 0);
+    try {
+      const entries: DigestEntry[] = [];
+      const combined: string[] = [];
+      const existingTags: string[] = [];
+
+      for (const file of shown) {
+        const markdown = await this.app.vault.cachedRead(file);
+        combined.push(markdown);
+        existingTags.push(...existingFrontmatterTags(markdown));
+        entries.push({
+          basename: file.basename,
+          path: file.path,
+          summary: summariseLocally(markdown, this.settings.summarySentenceCount),
+          // Mentions of notes outside this week's set are not the digest's
+          // business; the finder is only reused to spot links within it.
+          links: findLinkSuggestions(this.app, file, markdown, this.settings).filter(
+            (suggestion) => shownPaths.has(suggestion.path)
+          ),
+        });
+      }
+
+      const date = formatDigestDate(now);
+      const section = buildDigestSection(
+        date,
+        formatDigestDate(new Date(cutoff)),
+        entries,
+        suggestTagsLocally(combined.join('\n\n'), this.settings.maxTags, existingTags),
+        week.length - shown.length
+      );
+
+      const existing = this.app.vault.getAbstractFileByPath(DIGEST_NOTE_PATH);
+      if (existing) {
+        const current = await this.app.vault.read(existing as TFile);
+        await this.app.vault.modify(existing as TFile, upsertDigestSection(current, section, date));
+      } else {
+        await this.app.vault.create(DIGEST_NOTE_PATH, upsertDigestSection('', section, date));
+      }
+
+      new Notice(
+        `Elias HiveMind: weekly digest updated in "${DIGEST_NOTE_PATH}" — ${week.length} note${week.length === 1 ? '' : 's'} from the last 7 days.`
+      );
+    } catch (error) {
+      console.error('Elias HiveMind weekly digest error', error);
+      new Notice(`Elias HiveMind: weekly digest failed. ${describeError(error)}`, 10000);
+    } finally {
+      pending.hide();
+    }
   }
 
   /* ------------------------------------------------------------ diagnostic */

@@ -317,6 +317,7 @@ async function main() {
     'generate-tags-local',
     'generate-tags-backend',
     'suggest-links',
+    'weekly-digest-local',
     'test-backend-connection',
   ];
   expected.forEach((id) => check('registered command: ' + id, ids.includes(id), 'got: ' + ids.join(', ')));
@@ -637,6 +638,173 @@ async function main() {
   let unloadErr = null;
   try { plugin.onunload(); } catch (e) { unloadErr = e; }
   check('onunload() ran clean', unloadErr === null, unloadErr && unloadErr.message);
+
+  console.log('\n[13] weekly digest (local): window, assembly, create');
+  const DAY = 24 * 60 * 60 * 1000;
+  const nowMs = Date.now();
+  const pad2 = (n) => String(n).padStart(2, '0');
+  const fmtDate = (t) => { const d = new Date(t); return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()); };
+  const todayStr = fmtDate(nowMs);
+
+  const alphaText = [
+    '# Alpha Harvest', '',
+    'The harvest planning guide explains soil preparation for winter gardens.',
+    'Soil preparation improves harvest yields across winter gardens.',
+    'Harvest records track every garden bed through the winter season.',
+  ].join('\n');
+  const betaText = [
+    '---', 'tags: [calendar]', '---',
+    '# Beta Notes', '',
+    'Beta references the Alpha Harvest while reviewing garden timelines.',
+    'Garden timelines align planting with the harvest calendar.',
+  ].join('\n');
+  const gammaText = [
+    '# Gamma Fresh', '',
+    'Gamma captures quick ideas for the workshop backlog.',
+    'Workshop backlog items get reviewed every Friday afternoon.',
+  ].join('\n');
+  const fillerText = 'Filler body text with enough ordinary words to summarise safely here.';
+
+  function mkStatFile(basename, ctime, mtime, folder) {
+    const f = mkFile(basename, folder);
+    f.stat = { ctime, mtime, size: 100 };
+    return f;
+  }
+
+  /** Lets the digest command's chain of awaited vault calls settle. */
+  async function flushMany() {
+    for (let i = 0; i < 12; i += 1) await new Promise((r) => setImmediate(r));
+  }
+
+  function makeDigestRig(files, contents, digestContent) {
+    const store = { created: null, modified: null };
+    const digestFile = digestContent === null
+      ? null
+      : mkStatFile('Weekly Digest', nowMs - DAY, nowMs - 1000);
+    const all = digestFile ? files.concat([digestFile]) : files;
+    const digestApp = {
+      vault: {
+        configDir: '.hivecfg',
+        getName: () => 'DigestVault',
+        getMarkdownFiles: () => all,
+        getFiles: () => all,
+        getAbstractFileByPath: (p) => (p === 'Weekly Digest.md' ? digestFile : null),
+        read: async () => digestContent,
+        cachedRead: async (f) => contents[f.path] || '',
+        create: async (p, data) => { store.created = { path: p, data }; return digestFile; },
+        modify: async (f, data) => { store.modified = data; },
+      },
+      workspace: { getActiveFile: () => null, getActiveViewOfType: () => null },
+      metadataCache: {
+        resolvedLinks: {}, unresolvedLinks: {},
+        getFileCache: () => null,
+        getFirstLinkpathDest: () => null,
+      },
+    };
+    return { digestApp, store };
+  }
+
+  async function runDigest(rig) {
+    const p = new PluginClass(rig.digestApp, manifest);
+    await p.onload();
+    const cmd = p._commands.find((c) => c.id === 'weekly-digest-local');
+    NOTICES.length = 0;
+    cmd.callback();
+    await flushMany();
+    return p;
+  }
+
+  // Beta: created long ago, modified yesterday (mtime leg).
+  // Gamma: created an hour ago, mtime old (ctime leg).
+  // Delta: both timestamps outside the window. Template: recent but ignored folder.
+  const weekFiles = [
+    mkStatFile('Alpha Harvest', nowMs - 2 * DAY, nowMs - 2 * DAY),
+    mkStatFile('Beta Notes', nowMs - 30 * DAY, nowMs - DAY),
+    mkStatFile('Gamma Fresh', nowMs - 60 * 60 * 1000, nowMs - 30 * DAY),
+    mkStatFile('Delta Old', nowMs - 30 * DAY, nowMs - 8 * DAY),
+    mkStatFile('Fresh Template', nowMs - DAY, nowMs - DAY, 'templates'),
+  ];
+  const weekContents = {
+    'Alpha Harvest.md': alphaText,
+    'Beta Notes.md': betaText,
+    'Gamma Fresh.md': gammaText,
+    'Delta Old.md': fillerText,
+    'templates/Fresh Template.md': fillerText,
+  };
+
+  const createRig = makeDigestRig(weekFiles, weekContents, null);
+  await runDigest(createRig);
+  check('digest note created at the vault root', createRig.store.created && createRig.store.created.path === 'Weekly Digest.md');
+  check('existing digest note not modified on first run', createRig.store.modified === null);
+  const digestText = createRig.store.created ? createRig.store.created.data : '';
+  check('digest carries the note title and a dated heading',
+    digestText.includes('# Weekly Digest') && digestText.includes('## Weekly Digest — ' + todayStr), digestText.slice(0, 200));
+  check('count line names the window start',
+    digestText.includes('3 notes created or modified since ' + fmtDate(nowMs - 7 * DAY)), digestText.slice(0, 300));
+  check('mtime leg included (Beta), ctime leg included (Gamma)',
+    digestText.includes('### [[Beta Notes]]') && digestText.includes('### [[Gamma Fresh]]'));
+  check('stale note and ignored-folder note excluded',
+    !digestText.includes('[[Delta Old]]') && !digestText.includes('[[Fresh Template]]'));
+  check('entries are ordered most recently modified first',
+    digestText.indexOf('[[Beta Notes]]') < digestText.indexOf('[[Alpha Harvest]]') &&
+    digestText.indexOf('[[Alpha Harvest]]') < digestText.indexOf('[[Gamma Fresh]]'));
+  check('per-note local summary is embedded',
+    digestText.includes('Soil preparation improves harvest yields across winter gardens.'), digestText.slice(0, 600));
+  check('mention of another week note becomes a link line',
+    digestText.includes("Links to this week's notes: [[Alpha Harvest]]"), digestText.slice(0, 900));
+  check('aggregate tag suggestions close the section',
+    digestText.includes('### Suggested tags for this week') && digestText.includes('#harvest'), digestText.slice(-300));
+  check('success notice fired',
+    NOTICES.some((n) => n.includes('weekly digest updated')), NOTICES.join(' | '));
+
+  console.log('\n[13b] weekly digest: same-day re-run replaces the section');
+  const staleDigest = [
+    '# Weekly Digest', '',
+    '## Weekly Digest — ' + todayStr, '',
+    'STALE MARKER paragraph.', '',
+    '## Weekly Digest — 2026-01-05', '',
+    'Old section stays.', '',
+  ].join('\n');
+  const updateRig = makeDigestRig([weekFiles[0]], weekContents, staleDigest);
+  await runDigest(updateRig);
+  const updated = updateRig.store.modified || '';
+  check('existing digest note modified, not recreated', Boolean(updateRig.store.modified) && updateRig.store.created === null);
+  check('stale section content replaced', !updated.includes('STALE MARKER'), updated.slice(0, 400));
+  check("today's heading appears exactly once",
+    updated.split('## Weekly Digest — ' + todayStr).length - 1 === 1, updated.slice(0, 400));
+  check('older dated sections are preserved',
+    updated.includes('## Weekly Digest — 2026-01-05') && updated.includes('Old section stays.'));
+  check('the digest note never digests itself', !updated.includes('### [[Weekly Digest]]'), updated.slice(0, 400));
+
+  console.log('\n[13c] weekly digest: empty week writes nothing');
+  const emptyRig = makeDigestRig(
+    [mkStatFile('Delta Old', nowMs - 30 * DAY, nowMs - 8 * DAY)],
+    { 'Delta Old.md': fillerText },
+    null
+  );
+  await runDigest(emptyRig);
+  check('empty week produced the no-notes notice',
+    NOTICES.some((n) => n.includes('no notes created or modified in the last 7 days')), NOTICES.join(' | '));
+  check('empty week created and modified nothing', emptyRig.store.created === null && emptyRig.store.modified === null);
+
+  console.log('\n[13d] weekly digest: a huge week is capped, and the cap is stated');
+  const capFiles = [];
+  const capContents = {};
+  for (let i = 1; i <= 55; i += 1) {
+    const base = 'Cap Note ' + String(i).padStart(2, '0');
+    capFiles.push(mkStatFile(base, nowMs - i * 60000, nowMs - i * 60000));
+    capContents[base + '.md'] = 'Cap topic sentence about orchards and kilns. Orchards and kilns appear in every cap note body.';
+  }
+  const capRig = makeDigestRig(capFiles, capContents, null);
+  await runDigest(capRig);
+  const capText = capRig.store.created ? capRig.store.created.data : '';
+  check('exactly 50 entries are listed', (capText.match(/### \[\[/g) || []).length === 50,
+    'entries: ' + (capText.match(/### \[\[/g) || []).length);
+  check('the overflow is counted in the digest',
+    capText.includes('and 5 more notes from this week'), capText.slice(-300));
+  check('the count line still reports the whole week',
+    capText.includes('55 notes created or modified since ' + fmtDate(nowMs - 7 * DAY)), capText.slice(0, 300));
+  check('the 51st note is not listed', !capText.includes('### [[Cap Note 51]]'));
 
   console.log('\n' + '='.repeat(56));
   console.log('  PASSED: ' + passed + '   FAILED: ' + failed);

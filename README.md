@@ -3,7 +3,7 @@
 Summaries, tag suggestions and link suggestions for Obsidian, working offline by default and using a local Ollama model when you want one.
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.0.2
+- **Version:** 1.1.0
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -62,12 +62,26 @@ Finds other notes whose **title or alias** appears in the current note as a whol
 
 The chosen links are appended to the end of the note under a `## Suggested links` heading. Mentions found through an alias are inserted as `[[Note name|alias]]`.
 
+### Weekly digest
+
+Collects every note created or modified in the last seven days and writes a dated section into a single note, `Weekly Digest.md` at the root of the vault:
+
+- Each note in the week gets its own heading — a wikilink to the note — followed by its local summary, most recently modified first.
+- Where a note in the week mentions another note in the same week without linking it, the digest lists that as a suggested link under the note's summary, using the same matching rules as link suggestion. The digest note itself, the configuration folder and ignored folders are excluded, just as they are for link suggestion.
+- The section closes with tag suggestions for the week as a whole: the local tagger run over the week's notes combined, skipping tags those notes already carry.
+- A week with more than 50 changed notes lists the 50 most recently modified and says how many more there were, rather than producing an unreadable note.
+- Running the command again on the same day replaces that day's section instead of adding a duplicate; sections from earlier days are kept.
+- If nothing changed in the last seven days, a notice says so and no digest is written.
+
+The digest is local only. A backend variant would mean one model call per note in the week, so it uses the local summarizer and stays fully offline.
+
 ---
 
 ## Privacy
 
 - **Local commands** (every command marked *local*, and *Suggest links for current note*) make no network requests.
 - **Suggest links for current note** reads the file list of the whole vault (the names, paths and aliases of your notes) to find mentions of them in the current note. It does this only when you run the command, and nothing it reads is stored or sent anywhere.
+- **Weekly digest (local)** reads the notes created or modified in the last seven days (their content, to summarize them), only when you run the command. The only thing it writes is the digest note, inside your vault.
 - **Backend commands** send the note's plain text, with frontmatter and code blocks removed, to the **Backend URL** you configure. The default is `http://127.0.0.1:11434/api/generate`, a local Ollama server, so the text doesn't leave your computer unless you change that URL.
 - **Opening the settings tab** sends one request to the same server for its list of installed models. No note content is included.
 - The plugin doesn't collect or send any usage data.
@@ -232,6 +246,7 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 | Suggest tags for current note (local) | None | Suggests tags from the note's most frequent words; you pick which to add to frontmatter. |
 | Suggest tags for current note (backend) | Backend URL | Asks the model for tags; you pick which to add to frontmatter. Falls back to local if enabled. |
 | Suggest links for current note | None | Lists notes mentioned but not linked; you pick which links to append. |
+| Weekly digest (local) | None | Summarizes the notes created or modified in the last seven days into `Weekly Digest.md`. |
 | Test backend connection | Backend URL | Sends a test sentence and shows the reply or the error. |
 
 ---
@@ -324,7 +339,7 @@ npm run package     # zip main.js + manifest.json + styles.css into build/elias-
 
 3. The **Release** workflow (`.github/workflows/release.yml`) runs typecheck, build, tests and packaging, and fails if the tag doesn't match `manifest.json`. It then creates build provenance attestations for `main.js`, `manifest.json` and `styles.css`, and publishes a GitHub release with those three files and generated release notes. The verified zip is kept as a workflow artifact, not a release asset.
 
-`npm test` runs `test/run-tests.js`, which loads the **built bundle** with a stubbed Obsidian API and exercises every command: local and backend summaries, fallback on refused connections, timeouts and HTTP errors, tag normalisation and frontmatter merging, link suggestions, model listing for both request formats, and settings persistence. Run `npm run build` before `npm test`.
+`npm test` runs `test/run-tests.js`, which loads the **built bundle** with a stubbed Obsidian API and exercises every command: local and backend summaries, fallback on refused connections, timeouts and HTTP errors, tag normalisation and frontmatter merging, link suggestions, the weekly digest, model listing for both request formats, and settings persistence. A `pretest` script builds `dist/main.js` first, so `npm test` works on a fresh clone.
 
 ### Project layout
 
@@ -337,6 +352,7 @@ npm run package     # zip main.js + manifest.json + styles.css into build/elias-
 | `scripts/install-to-vault.js` | Installs the build into a vault |
 | `scripts/package.js` | Builds and verifies the release zip |
 | `scripts/health.js` | Build artifact check |
+| `CHANGELOG.md` | Release history |
 | `manifest.json` | Obsidian plugin manifest |
 | `versions.json` | Maps each plugin version to its minimum Obsidian version |
 | `.github/workflows/release.yml` | Tag-triggered release workflow |
