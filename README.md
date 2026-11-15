@@ -47,10 +47,19 @@ Sends the note's plain text to a model served by Ollama (or any OpenAI-compatibl
 
 Suggests tags either locally or from your model. Local suggestions use the note's most frequent words of four or more letters, and prefer words that appear more than once. The suggestions appear in a checklist, and the tags you keep are merged into the note's frontmatter:
 
+- Local suggestions are **vault-aware**: the tagger reads the tags your vault already uses (from the metadata cache — no note content is read) and prefers them over words it would otherwise invent. A word that matches an established tag is suggested in the form your vault writes it, casing included, and a word matching the last part of a nested tag (the `compost` in `garden/compost`) suggests the full nested tag. Established tags also rank ahead of new words.
 - Tags are normalised to valid Obsidian tags: lowercase, no leading `#`, spaces become hyphens, and only letters, digits, `_`, `-` and `/` are kept. Purely numeric tags and tags over 40 characters are dropped.
 - Tags already in the frontmatter are never suggested again or duplicated.
 - The `tags:` field is written as a YAML list. Other frontmatter fields and the note body are not changed.
 - If the note has no frontmatter, a frontmatter block is created at the top.
+
+### Housekeeping sweep
+
+Tagging a messy vault one note at a time does not scale, so the **Housekeeping sweep** command runs the local tagger over a whole scope at once:
+
+- You pick the scope first: the whole vault, or any folder (subfolders included). The configuration folder, your ignored folders and the digest note are always excluded.
+- The sweep is a **dry run**: it scans at most 50 notes (in path order) and shows one review list — each note with the tags it would gain. Notes beyond the cap are counted in the review, never silently skipped.
+- **Nothing is written until you confirm.** Ticking or unticking notes in the review is the whole decision; applying writes frontmatter tag merges only, via the same merge as the single-note command. Note bodies are never touched, and closing the review changes nothing.
 
 ### Internal link suggestions
 
@@ -89,6 +98,7 @@ Saved articles pile up in a clippings folder and are never read. The backlog dig
   - **Gone stale** — untouched since it was saved, older than the *Stale after (days)* setting (default 30), and with no overlap with your recent work. These are archive candidates.
   - **Junk candidates** — near-empty (under 25 words of readable text) or a near-duplicate of another clipping, judged by overlap of their significant words.
 - One run digests at most 50 unread clippings, most recently saved first, so a 500-clipping pile stays fast — including on a phone. The rest are counted in the section and picked up by the next run. Clippings in the archive folder, the configuration folder and ignored folders are excluded, and clippings you have marked read are skipped (the scan checks the metadata cache first, so a large already-read pile costs no file reads).
+- From the second run on, the section opens with a one-line progress report — how many clippings left the pile since the last run, or that it grew, or that nothing changed — measured against the previous run's count, which the plugin remembers between runs.
 - Processing is one explicit command per clipping, run while the clipping is open: **apply suggested tags** (the usual checklist, written to frontmatter), **link** (the usual unlinked-mention checklist, appended under a `## Suggested links` heading), **mark as read** (writes a `hivemind-read: true` frontmatter property; marked clippings drop out of later digests), or **archive** (moves the clipping into the archive folder, default `Archive`, creating it if needed and refusing rather than overwriting a same-named note). The digest itself only links to each clipping — opening the link is the tap. **The plugin never deletes anything, and never moves or marks a note on its own.**
 - Optionally, with *Backlog themes via backend* switched on, a digest run also asks your configured backend to group the clippings into cross-article themes. It is off by default and best-effort: if the backend is unreachable the local digest is written without themes.
 
@@ -100,6 +110,7 @@ Saved articles pile up in a clippings folder and are never read. The backlog dig
 - **Suggest links for current note** reads the file list of the whole vault (the names, paths and aliases of your notes) to find mentions of them in the current note. It does this only when you run the command, and nothing it reads is stored or sent anywhere.
 - **Weekly digest (local)** reads the notes created or modified in the last seven days (their content, to summarize them), only when you run the command. The only thing it writes is the digest note, inside your vault.
 - **Backlog digest** reads the clippings in your backlog folders or carrying a backlog tag (their content, to summarize and classify them) and the notes you touched in the last seven days (to judge relevance), only when you run a digest command. Tag-based selection reads only the metadata cache's tag list, never file content. It writes only the digest note. The four **Backlog:** processing commands write or move only the one note you run them on — a tag merge, appended links, a `hivemind-read: true` frontmatter marker, or a move into your archive folder — and only when you run them.
+- **Housekeeping sweep** reads the notes in the scope you pick (their content, to compute tag suggestions) only when you run the command and choose that scope, and writes only the frontmatter tag merges you approve in its review — nothing is written by the scan itself. Vault-aware tag suggestions additionally read the metadata cache's tag list for the whole vault, never note content.
 - **Backlog themes**, only if you switch *Backlog themes via backend* on, sends the clippings' titles and summaries (not their full text) to the **Backend URL** you configure — the same local server as the other backend commands. With the setting off, no backlog request is ever made.
 - **Backend commands** send the note's plain text, with frontmatter and code blocks removed, to the **Backend URL** you configure. The default is `http://127.0.0.1:11434/api/generate`, a local Ollama server, so the text doesn't leave your computer unless you change that URL.
 - **Opening the settings tab** sends one request to the same server for its list of installed models. No note content is included.
@@ -262,9 +273,10 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 | Summarize current note (local) | None | Inserts a local summary under the summary heading, at the configured insert position. |
 | Summarize current note (backend) | Backend URL | Inserts a model-generated summary. Falls back to local if enabled. |
 | Summarize selection (local) | None | Summarizes the selected text and inserts the heading and summary directly after the selection. Ignores the insert-position setting. |
-| Suggest tags for current note (local) | None | Suggests tags from the note's most frequent words; you pick which to add to frontmatter. |
+| Suggest tags for current note (local) | None | Suggests tags from the note's most frequent words, preferring tags your vault already uses; you pick which to add to frontmatter. |
 | Suggest tags for current note (backend) | Backend URL | Asks the model for tags; you pick which to add to frontmatter. Falls back to local if enabled. |
 | Suggest links for current note | None | Lists notes mentioned but not linked; you pick which links to append. |
+| Housekeeping sweep: suggest tags for a folder or the vault | None | Dry-runs the local tagger over a folder (subfolders included) or the whole vault, at most 50 notes per run; you review every proposed change and approve per note before anything is written. Writes frontmatter tag merges only. |
 | Weekly digest (local) | None | Summarizes the notes created or modified in the last seven days into `Weekly Digest.md`. |
 | Backlog digest | None¹ | Digests the unread clippings in your backlog folders (or carrying a backlog tag) into the "Your backlog" section of `Weekly Digest.md`: summary, tags, read time, age, bucketed by relevance. |
 | Backlog: apply suggested tags to current note | None | Suggests tags for the open clipping and merges the ones you pick into its frontmatter. Only on a backlog clipping. |

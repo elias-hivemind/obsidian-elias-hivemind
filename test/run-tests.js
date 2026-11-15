@@ -317,6 +317,7 @@ async function main() {
     'generate-tags-local',
     'generate-tags-backend',
     'suggest-links',
+    'housekeeping-sweep',
     'weekly-digest-local',
     'backlog-digest',
     'backlog-apply-tags',
@@ -1309,6 +1310,262 @@ async function main() {
   check('a clipping with an unlisted tag stays out', !tagSelText.includes('[[Other Clip]]'));
   check('the section header names the tag selection',
     tagSelText.includes('or tagged #to-read, #someday'), tagSelText.slice(0, 300));
+
+  console.log('\n[22] vault-aware tags: canonical form, ranking, nested leaf');
+  const vocabCaches = {
+    'Compost Guide.md': { frontmatter: { tags: ['Composting', 'garden'] } },
+    'Second Guide.md': { frontmatter: { tags: ['Composting'] } },
+    'Nested Note.md': { frontmatter: { tags: ['garden/compost'] } },
+    'Alpha Garden.md': { frontmatter: { tags: ['Garden'] } },
+    'Beta Garden.md': { frontmatter: { tags: ['Garden'] } },
+  };
+  const vocabRig = makeBacklogRig(
+    [
+      mkStatFile('Compost Guide', nowMs - DAY, nowMs - DAY),
+      mkStatFile('Second Guide', nowMs - DAY, nowMs - DAY),
+      mkStatFile('Nested Note', nowMs - DAY, nowMs - DAY),
+      mkStatFile('Alpha Garden', nowMs - DAY, nowMs - DAY),
+      mkStatFile('Beta Garden', nowMs - DAY, nowMs - DAY),
+      mkStatFile('Fresh Thoughts', nowMs - DAY, nowMs - DAY),
+    ],
+    {},
+    vocabCaches,
+    null,
+    'Fresh Thoughts.md'
+  );
+  const vocabPlugin = new PluginClass(vocabRig.app, manifest);
+  await vocabPlugin.onload();
+  const vocabTagCmd = vocabPlugin._commands.find((c) => c.id === 'generate-tags-local');
+  const freshFile = vocabRig.app.vault.getMarkdownFiles().find((f) => f.path === 'Fresh Thoughts.md');
+
+  async function tagLabelsFor(text) {
+    const ed = new MockEditor(text);
+    MODALS.length = 0;
+    await vocabTagCmd.editorCallback(ed, { file: freshFile });
+    await flush();
+    if (MODALS.length === 0) return { labels: [], ed };
+    const nodes = walk(MODALS[MODALS.length - 1].contentEl);
+    const labels = nodes.filter((n) => n.tagName === 'SPAN').map((n) => n.textContent);
+    return { labels, ed };
+  }
+
+  const canonRun = await tagLabelsFor(
+    'Composting turns kitchen scraps into rich soil. Composting needs air, moisture and patience. A healthy composting pile heats up quickly in spring.'
+  );
+  check('a candidate matching a vault tag is suggested in the vault canonical form',
+    canonRun.labels.includes('#Composting') && !canonRun.labels.includes('#composting'),
+    JSON.stringify(canonRun.labels));
+  confirmLatestModal('Add selected tags');
+  check('the canonical form is what lands in frontmatter',
+    canonRun.ed.text.includes('- Composting'), canonRun.ed.text.slice(0, 120));
+
+  const rankRun = await tagLabelsFor('Mulch mulch mulch mulch mulch. Composting composting.');
+  check('an established vault tag outranks a more frequent invented word',
+    rankRun.labels[0] === '#Composting' && rankRun.labels[1] === '#mulch',
+    JSON.stringify(rankRun.labels));
+
+  const leafRun = await tagLabelsFor(
+    'Compost feeds the beds before planting. Compost breaks down fast in warm weather. Good compost smells earthy and rich.'
+  );
+  check('a candidate matching the leaf of a nested vault tag suggests the full nested tag',
+    leafRun.labels.includes('#garden/compost'), JSON.stringify(leafRun.labels));
+
+  const caseRun = await tagLabelsFor(
+    'The garden wakes early in March. Garden work starts at dawn every day. Every garden needs a plan for the season.'
+  );
+  check('the canonical form is the spelling most notes use (Garden, 2 of 3)',
+    caseRun.labels.includes('#Garden') && !caseRun.labels.includes('#garden'),
+    JSON.stringify(caseRun.labels));
+
+  console.log('\n[23] backlog digest tag suggestions use the vault vocabulary');
+  const digestVocabRig = makeBacklogRig(
+    [
+      mkStatFile('Garden Guide', nowMs - DAY, nowMs - DAY),
+      mkStatFile('Clip One', nowMs - 2 * DAY, nowMs - 2 * DAY, 'Clippings'),
+    ],
+    {
+      'Garden Guide.md': '# Garden Guide\n\nOur standing notes on soil care and bed rotation for the season.',
+      'Clippings/Clip One.md': '# Clip One\n\nComposting turns scraps into soil for the beds. Composting needs air and regular turning. The composting pile heats up quickly in spring weather.',
+    },
+    { 'Garden Guide.md': { frontmatter: { tags: ['Composting'] } } },
+    null
+  );
+  await runBacklog(digestVocabRig);
+  const digestVocabText = digestVocabRig.store.created ? digestVocabRig.store.created.data : '';
+  check('the digest item carries the canonical vault tag, not a lowercase reinvention',
+    digestVocabText.includes('#Composting') && !digestVocabText.includes('#composting'),
+    digestVocabText.slice(0, 900));
+
+  console.log('\n[24] housekeeping sweep: scope, exclusions, confirm gate, frontmatter-only writes');
+  function makeSweepRig(files, contents, caches, digestContent) {
+    const base = makeBacklogRig(files, contents, caches, digestContent);
+    const store = { modifies: [] };
+    base.app.vault.modify = async (f, data) => {
+      store.modifies.push({ path: f.path, data });
+      contents[f.path] = data;
+    };
+    return { app: base.app, store };
+  }
+
+  const sweepContents = {
+    'Clippings/Sweep One.md': '# Sweep One\n\nGardens need water. Water the gardens daily. Gardens grow fast.',
+    'Clippings/Sweep Two.md': '---\ntags:\n  - gardens\n---\n# Sweep Two\n\nRoses need pruning. Pruning roses keeps them healthy. Roses bloom in June.',
+    'templates/Sweep Template.md': '# Sweep Template\n\nGardens need water. Water the gardens daily. Gardens grow fast.',
+    '.hivecfg/Sweep Config.md': '# Sweep Config\n\nGardens need water. Water the gardens daily. Gardens grow fast.',
+    'Weekly Digest.md': '# Weekly Digest\n\nWeekly digest weekly digest. Digest notes digest notes weekly.',
+  };
+  const sweepRig = makeSweepRig(
+    [
+      mkStatFile('Sweep One', nowMs - DAY, nowMs - DAY, 'Clippings'),
+      mkStatFile('Sweep Two', nowMs - DAY, nowMs - DAY, 'Clippings'),
+      mkStatFile('Sweep Template', nowMs - DAY, nowMs - DAY, 'templates'),
+      mkStatFile('Sweep Config', nowMs - DAY, nowMs - DAY, '.hivecfg'),
+    ],
+    Object.assign({}, sweepContents),
+    null,
+    sweepContents['Weekly Digest.md']
+  );
+  const sweepPlugin = new PluginClass(sweepRig.app, manifest);
+  await sweepPlugin.onload();
+  MODALS.length = 0;
+  sweepPlugin._commands.find((c) => c.id === 'housekeeping-sweep').callback();
+  await flushMany();
+  check('the sweep opens a scope picker first', MODALS.length === 1, 'modals: ' + MODALS.length);
+  const scopeNodes = walk(MODALS[MODALS.length - 1].contentEl);
+  const wholeVaultButton = scopeNodes.find((n) => n.tagName === 'BUTTON' && n.textContent === 'Whole vault');
+  check('the scope picker offers the whole vault and each folder',
+    Boolean(wholeVaultButton) && scopeNodes.some((n) => n.tagName === 'BUTTON' && n.textContent === 'Clippings'));
+  wholeVaultButton.click();
+  await flushMany();
+  check('confirm gate: the dry run itself writes nothing', sweepRig.store.modifies.length === 0,
+    JSON.stringify(sweepRig.store.modifies.map((m) => m.path)));
+  const reviewNodes = walk(MODALS[MODALS.length - 1].contentEl);
+  const sweepBoxes = reviewNodes.filter((n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+  check('review lists one row per note needing tags - ignored folder, config folder and digest note excluded',
+    sweepBoxes.length === 2, 'rows: ' + sweepBoxes.length);
+  check('review rows name the proposed tags',
+    reviewNodes.some((n) => n.textContent.includes('#gardens')) &&
+    reviewNodes.some((n) => n.textContent.includes('#roses')),
+    reviewNodes.map((n) => n.textContent).join(' | '));
+  sweepBoxes[1].checked = false;
+  sweepBoxes[1].dispatchChange();
+  const applyButton = reviewNodes.find((n) => n.tagName === 'BUTTON' && n.textContent === 'Apply tags to selected notes');
+  check('review has an explicit apply button', Boolean(applyButton));
+  applyButton.click();
+  await flushMany();
+  check('only the ticked note was written', sweepRig.store.modifies.length === 1 &&
+    sweepRig.store.modifies[0].path === 'Clippings/Sweep One.md',
+    JSON.stringify(sweepRig.store.modifies.map((m) => m.path)));
+  check('the write is a frontmatter tag merge',
+    sweepRig.store.modifies[0].data.startsWith('---\ntags:\n  - gardens') &&
+    sweepRig.store.modifies[0].data.includes('  - water'),
+    sweepRig.store.modifies[0].data.slice(0, 160));
+  check('the note body survives the sweep untouched',
+    sweepRig.store.modifies[0].data.includes('# Sweep One\n\nGardens need water. Water the gardens daily. Gardens grow fast.'));
+  check('a completion notice fired', NOTICES.some((n) => n.includes('sweep added tags to 1 note')), NOTICES.join(' | '));
+
+  console.log('\n[24b] housekeeping sweep: cancelling the review writes nothing');
+  const cancelRig = makeSweepRig(
+    [mkStatFile('Sweep One', nowMs - DAY, nowMs - DAY, 'Clippings')],
+    { 'Clippings/Sweep One.md': sweepContents['Clippings/Sweep One.md'] },
+    null,
+    null
+  );
+  const cancelPlugin = new PluginClass(cancelRig.app, manifest);
+  await cancelPlugin.onload();
+  MODALS.length = 0;
+  cancelPlugin._commands.find((c) => c.id === 'housekeeping-sweep').callback();
+  await flushMany();
+  walk(MODALS[MODALS.length - 1].contentEl)
+    .find((n) => n.tagName === 'BUTTON' && n.textContent === 'Clippings')
+    .click();
+  await flushMany();
+  walk(MODALS[MODALS.length - 1].contentEl)
+    .find((n) => n.tagName === 'BUTTON' && n.textContent === 'Cancel')
+    .click();
+  await flushMany();
+  check('folder scope works and cancel leaves every note untouched',
+    cancelRig.store.modifies.length === 0, JSON.stringify(cancelRig.store.modifies));
+
+  console.log('\n[24c] housekeeping sweep: the per-run cap is bounded and stated');
+  const capSweepFiles = [];
+  const capSweepContents = {};
+  for (let i = 1; i <= 55; i += 1) {
+    const base = 'Cap Sweep ' + String(i).padStart(2, '0');
+    capSweepFiles.push(mkStatFile(base, nowMs - DAY, nowMs - DAY, 'Clippings'));
+    capSweepContents['Clippings/' + base + '.md'] =
+      '# ' + base + '\n\nGardens need water. Water the gardens daily. Gardens grow fast.';
+  }
+  const capSweepRig = makeSweepRig(capSweepFiles, capSweepContents, null, null);
+  const capSweepPlugin = new PluginClass(capSweepRig.app, manifest);
+  await capSweepPlugin.onload();
+  MODALS.length = 0;
+  capSweepPlugin._commands.find((c) => c.id === 'housekeeping-sweep').callback();
+  await flushMany();
+  walk(MODALS[MODALS.length - 1].contentEl)
+    .find((n) => n.tagName === 'BUTTON' && n.textContent === 'Whole vault')
+    .click();
+  await flushMany();
+  const capReviewNodes = walk(MODALS[MODALS.length - 1].contentEl);
+  const capBoxes = capReviewNodes.filter((n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+  check('exactly 50 notes are scanned in one run', capBoxes.length === 50, 'rows: ' + capBoxes.length);
+  check('the overflow is stated in the review',
+    capReviewNodes.some((n) => n.textContent.includes('5 more notes were not scanned')),
+    capReviewNodes.map((n) => n.textContent).join(' | ').slice(0, 300));
+  check('the capped dry run also writes nothing', capSweepRig.store.modifies.length === 0);
+
+  console.log('\n[25] backlog progress line: first run silent, later runs report the movement');
+  const progressContents = {
+    'Clippings/Pile One.md': '# Pile One\n\nAstronomy notes about telescopes, dark skies and the planets visible this month from the hill.',
+    'Clippings/Pile Two.md': '# Pile Two\n\nSourdough baking notes about starters, hydration, fermentation timing and crust development at home.',
+    'Clippings/Pile Three.md': '# Pile Three\n\nKayaking notes about river levels, paddle technique, safety checks and planning weekend trips downstream.',
+    'Weekly Digest.md': '',
+  };
+  const progressRig = makeBacklogRig(
+    [
+      mkStatFile('Pile One', nowMs - 2 * DAY, nowMs - 2 * DAY, 'Clippings'),
+      mkStatFile('Pile Two', nowMs - 3 * DAY, nowMs - 3 * DAY, 'Clippings'),
+      mkStatFile('Pile Three', nowMs - 4 * DAY, nowMs - 4 * DAY, 'Clippings'),
+    ],
+    progressContents,
+    null,
+    ''
+  );
+  const progressPlugin1 = new PluginClass(progressRig.app, manifest);
+  await progressPlugin1.onload();
+  NOTICES.length = 0;
+  progressPlugin1._commands.find((c) => c.id === 'backlog-digest').callback();
+  await flushMany();
+  const progressText1 = progressRig.store.modified ? progressRig.store.modified.data : '';
+  check('first run writes the backlog block with no progress line',
+    progressText1.includes('### Your backlog') && !progressText1.includes('Since the last run'),
+    progressText1.slice(0, 500));
+  check('first run still records the baseline for next time',
+    progressPlugin1._data && progressPlugin1._data.backlogLastUnread === 3 &&
+    progressPlugin1._data.backlogLastRunDate === todayStr,
+    JSON.stringify(progressPlugin1._data));
+
+  progressContents['Clippings/Pile One.md'] =
+    '---\nhivemind-read: true\n---\n' + progressContents['Clippings/Pile One.md'];
+  const progressPlugin2 = new PluginClass(progressRig.app, manifest);
+  progressPlugin2._data = progressPlugin1._data;
+  await progressPlugin2.onload();
+  await progressPlugin2.loadSettings();
+  progressPlugin2._commands.find((c) => c.id === 'backlog-digest').callback();
+  await flushMany();
+  const progressText2 = progressRig.store.modified ? progressRig.store.modified.data : '';
+  check('a later run reports how many clippings left the pile',
+    progressText2.includes('1 clipping left the pile — 2 unread now'), progressText2.slice(0, 500));
+  check('the baseline moves to the new count',
+    progressPlugin2._data && progressPlugin2._data.backlogLastUnread === 2,
+    JSON.stringify(progressPlugin2._data));
+
+  progressRig.store.modified = null;
+  progressPlugin2._commands.find((c) => c.id === 'backlog-digest').callback();
+  await flushMany();
+  const progressText3 = progressRig.store.modified ? progressRig.store.modified.data : '';
+  check('an unchanged pile says so plainly',
+    progressText3.includes('No change since the last run'), progressText3.slice(0, 500));
 
   console.log('\n' + '='.repeat(56));
   console.log('  PASSED: ' + passed + '   FAILED: ' + failed);

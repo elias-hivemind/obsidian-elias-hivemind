@@ -14,7 +14,16 @@
  *
  *   Tag suggestion
  *     - local frequency-based tagging, or backend tagging with the same local
- *       fallback. Chosen tags are merged into the note's frontmatter.
+ *       fallback. Chosen tags are merged into the note's frontmatter. The
+ *       local tagger is vault-aware: it reads the vault's existing tag
+ *       vocabulary from the metadata cache and prefers those tags - in the
+ *       form the vault already uses - over words it would otherwise invent.
+ *
+ *   Housekeeping sweep
+ *     - the tagger run over a whole folder (or the vault) at once. A dry
+ *       run is presented for review first; nothing is written until the
+ *       user approves notes in the review, and approving writes frontmatter
+ *       tag merges only.
  *
  *   Link suggestion
  *     - scans the vault for notes whose title or alias appears verbatim in the
@@ -82,6 +91,15 @@ interface EliasHiveMindSettings {
   backlogStaleDays: number;
   backlogArchiveFolder: string;
   backlogThemesViaBackend: boolean;
+  /**
+   * Internal state, not a user setting (no settings-tab control): the
+   * unread-clipping count and date of the most recent backlog scan, kept
+   * so the next digest can say how the pile moved. -1 / '' means no scan
+   * has run yet. Persisted with the settings because loadData/saveData is
+   * the plugin's one storage slot.
+   */
+  backlogLastUnread: number;
+  backlogLastRunDate: string;
 }
 
 const DEFAULT_SETTINGS: EliasHiveMindSettings = {
@@ -109,6 +127,8 @@ const DEFAULT_SETTINGS: EliasHiveMindSettings = {
   backlogStaleDays: 30,
   backlogArchiveFolder: 'Archive',
   backlogThemesViaBackend: false,
+  backlogLastUnread: -1,
+  backlogLastRunDate: '',
 };
 
 /* ========================================================================== */
@@ -525,8 +545,106 @@ function mergeTagsIntoFrontmatter(
   return { oldHead: block ? block.text : '', newHead: ['---', ...lines, '---'].join(eol) + eol };
 }
 
-/** Frequency-based tags: repeated non-stopword terms, most frequent first. */
-function suggestTagsLocally(markdown: string, max: number, existing: string[]): string[] {
+/* ------------------------------------------------------- tag vocabulary */
+
+/** One established vault tag: the form the vault writes it in, and how many notes carry it. */
+interface VaultTagEntry {
+  /** The tag as the vault writes it (case preserved), safe to write back as-is. */
+  canonical: string;
+  /** Number of notes carrying the tag. */
+  count: number;
+}
+
+/** The vault's existing tags, keyed by normalised form. */
+type TagVocabulary = Map<string, VaultTagEntry>;
+
+/**
+ * Builds the vault's tag vocabulary from the metadata cache ONLY - each
+ * note's frontmatter tags and inline #tags, with per-tag note counts. No
+ * note content is read, so the cost is one cache lookup per note however
+ * large the vault is. The canonical form of a tag is the raw form most
+ * notes write it in (ties keep the first form seen, scanning notes in the
+ * order the vault lists them), so suggestions come back in the vault's own
+ * spelling instead of a lowercased reinvention.
+ */
+function buildTagVocabulary(app: App): TagVocabulary {
+  const counts = new Map<string, number>();
+  const forms = new Map<string, Map<string, number>>();
+
+  for (const file of app.vault.getMarkdownFiles()) {
+    const cache = app.metadataCache.getFileCache(file);
+    if (!cache) continue;
+
+    const raw: string[] = [];
+    const frontmatter = cache.frontmatter as Record<string, unknown> | undefined;
+    if (frontmatter && frontmatter.tags != null) {
+      const values = Array.isArray(frontmatter.tags) ? frontmatter.tags : [frontmatter.tags];
+      for (const value of values) {
+        if (typeof value === 'string') raw.push(value);
+      }
+    }
+    for (const entry of cache.tags ?? []) {
+      if (entry && typeof entry.tag === 'string') raw.push(entry.tag);
+    }
+
+    // A tag counts once per note however often the note repeats it, and a
+    // note's first written form is the one that votes for that note.
+    const perFile = new Map<string, string>();
+    for (const value of raw) {
+      const cleaned = value.trim().replace(/^#+/, '').trim().replace(/\s+/g, '-');
+      if (!cleaned) continue;
+      const normalised = normaliseTag(cleaned);
+      if (!normalised) continue;
+      // Only forms that round-trip through normalisation are safe to write
+      // back verbatim; anything else falls back to the normalised form.
+      if (!perFile.has(normalised)) {
+        perFile.set(normalised, normaliseTag(cleaned) === normalised ? cleaned : normalised);
+      }
+    }
+
+    perFile.forEach((form, normalised) => {
+      counts.set(normalised, (counts.get(normalised) ?? 0) + 1);
+      let byForm = forms.get(normalised);
+      if (!byForm) {
+        byForm = new Map<string, number>();
+        forms.set(normalised, byForm);
+      }
+      byForm.set(form, (byForm.get(form) ?? 0) + 1);
+    });
+  }
+
+  const vocabulary: TagVocabulary = new Map();
+  counts.forEach((count, normalised) => {
+    let canonical = normalised;
+    let best = -1;
+    forms.get(normalised)?.forEach((formCount, form) => {
+      if (formCount > best) {
+        canonical = form;
+        best = formCount;
+      }
+    });
+    vocabulary.set(normalised, { canonical, count });
+  });
+  return vocabulary;
+}
+
+/**
+ * Frequency-based tags: repeated non-stopword terms, most frequent first.
+ *
+ * When a vault vocabulary is supplied, candidates that correspond to an
+ * established vault tag - exactly, or as the leaf of a nested tag such as
+ * `garden/compost` - are suggested in the vault's canonical form and rank
+ * ahead of invented words within their tier: repeated vault tags before
+ * repeated new words, and (when nothing repeats at all) single-mention
+ * vault tags before single-mention new words. Without a vocabulary the
+ * ranking is exactly the pre-vault-aware one.
+ */
+function suggestTagsLocally(
+  markdown: string,
+  max: number,
+  existing: string[],
+  vocabulary?: TagVocabulary | null
+): string[] {
   const skip = new Set(existing);
   const freq = new Map<string, number>();
   const firstSeen = new Map<string, number>();
@@ -539,13 +657,79 @@ function suggestTagsLocally(markdown: string, max: number, existing: string[]): 
     if (!firstSeen.has(tag)) firstSeen.set(tag, index);
   });
 
-  const ranked = Array.from(freq.keys()).sort(
-    (a, b) => (freq.get(b) ?? 0) - (freq.get(a) ?? 0) || (firstSeen.get(a) ?? 0) - (firstSeen.get(b) ?? 0)
-  );
+  // Leaf index over the vocabulary: leaf segment -> the established tag
+  // with that leaf, most-used first (ties keep vocabulary order).
+  const leafIndex = new Map<string, string>();
+  if (vocabulary) {
+    vocabulary.forEach((_entry, normalised) => {
+      const leaf = normalised.split('/').pop() ?? normalised;
+      const current = leafIndex.get(leaf);
+      if (!current) {
+        leafIndex.set(leaf, normalised);
+        return;
+      }
+      const currentCount = vocabulary.get(current)?.count ?? 0;
+      const thisCount = vocabulary.get(normalised)?.count ?? 0;
+      if (thisCount > currentCount) leafIndex.set(leaf, normalised);
+    });
+  }
 
-  // Single mentions are mostly noise; use them only when nothing repeats.
-  const repeated = ranked.filter((t) => (freq.get(t) ?? 0) >= 2);
-  return (repeated.length > 0 ? repeated : ranked).slice(0, max);
+  interface Candidate {
+    out: string;
+    outNormalised: string;
+    fromVault: boolean;
+    vaultCount: number;
+    freq: number;
+    first: number;
+  }
+
+  const seenOut = new Set<string>();
+  const candidates: Candidate[] = [];
+  for (const tag of freq.keys()) {
+    let out = tag;
+    let fromVault = false;
+    let vaultCount = 0;
+
+    if (vocabulary) {
+      const direct = vocabulary.get(tag);
+      const viaLeaf = direct ? undefined : vocabulary.get(leafIndex.get(tag) ?? '');
+      const hit = direct ?? viaLeaf;
+      if (hit) {
+        out = hit.canonical;
+        fromVault = true;
+        vaultCount = hit.count;
+      }
+    }
+
+    const outNormalised = normaliseTag(out);
+    if (!out || skip.has(outNormalised) || seenOut.has(outNormalised)) continue;
+    seenOut.add(outNormalised);
+    candidates.push({
+      out,
+      outNormalised,
+      fromVault,
+      vaultCount,
+      freq: freq.get(tag) ?? 0,
+      first: firstSeen.get(tag) ?? 0,
+    });
+  }
+
+  const byRank = (a: Candidate, b: Candidate): number =>
+    b.freq - a.freq || b.vaultCount - a.vaultCount || a.first - b.first;
+  const byFrequency = (a: Candidate, b: Candidate): number =>
+    b.freq - a.freq || a.first - b.first;
+  const repeatedVault = candidates.filter((c) => c.fromVault && c.freq >= 2).sort(byRank);
+  const repeatedNew = candidates.filter((c) => !c.fromVault && c.freq >= 2).sort(byFrequency);
+  const singleVault = candidates.filter((c) => c.fromVault && c.freq < 2).sort(byRank);
+  const singleNew = candidates.filter((c) => !c.fromVault && c.freq < 2).sort(byFrequency);
+
+  // Single mentions are mostly noise; use them only when nothing repeats -
+  // the pre-vault-aware rule, with vault tags preferred inside each tier.
+  const pool =
+    repeatedVault.length + repeatedNew.length > 0
+      ? [...repeatedVault, ...repeatedNew]
+      : [...singleVault, ...singleNew];
+  return pool.slice(0, max).map((c) => c.out);
 }
 
 async function suggestTagsViaBackend(
@@ -570,6 +754,55 @@ async function suggestTagsViaBackend(
 
   if (tags.length === 0) throw new Error('Backend returned no usable tags.');
   return tags.slice(0, settings.maxTags);
+}
+
+/* ========================================================================== */
+/*                           housekeeping sweep                               */
+/* ========================================================================== */
+
+/**
+ * Upper bound on notes scanned in one sweep run - the same bound the
+ * digests use, for the same reason: an unbounded first run over a huge
+ * vault would be slow (doubly so on a phone). The overflow is counted and
+ * reported, and because a scope is scanned in path order, narrowing the
+ * scope (or re-running after applying) works through the rest.
+ */
+const SWEEP_MAX_NOTES = 50;
+
+/** One note the sweep proposes tags for. Nothing is written at plan time. */
+interface SweepPlanEntry {
+  file: TFile;
+  basename: string;
+  path: string;
+  tags: string[];
+}
+
+/** The dry-run result the review modal presents for approval. */
+interface SweepPlan {
+  /** Notes with at least one proposed tag, in path order. */
+  entries: SweepPlanEntry[];
+  /** Notes read and checked in this run. */
+  scanned: number;
+  /** In-scope notes not scanned because the per-run cap was reached. */
+  omitted: number;
+  /** Scanned notes that needed no new tags. */
+  unchanged: number;
+  /** Human-readable scope name for the review and the notices. */
+  scopeLabel: string;
+}
+
+/**
+ * The folders a sweep can target: every folder that directly holds at
+ * least one markdown note, sorted. Choosing a folder includes its
+ * subfolders, matching the backlog's folder semantics.
+ */
+function sweepFolderOptions(app: App): string[] {
+  const folders = new Set<string>();
+  for (const file of app.vault.getMarkdownFiles()) {
+    const slash = file.path.lastIndexOf('/');
+    if (slash > 0) folders.add(file.path.slice(0, slash));
+  }
+  return Array.from(folders).sort((a, b) => a.localeCompare(b));
 }
 
 /* ========================================================================== */
@@ -875,6 +1108,37 @@ interface BacklogScan {
   foldersLabel: string;
   /** Cross-item themes from the optional backend pass; '' when not run. */
   themes: string;
+  /** How the pile moved since the previous backlog scan; '' on the first scan. */
+  progressLine: string;
+}
+
+/**
+ * One plain sentence on how the backlog moved since the previous scan.
+ * First scan (no previous count/date) gets no line at all: the section
+ * already says how big the pile is, and a progress line needs a baseline.
+ */
+function backlogProgressLine(
+  previousCount: number,
+  previousDate: string,
+  current: number
+): string {
+  if (previousCount < 0 || !previousDate) return '';
+
+  if (current < previousCount) {
+    const cleared = previousCount - current;
+    return (
+      `Since the last run (${previousDate}), ${cleared} clipping${cleared === 1 ? '' : 's'} ` +
+      `left the pile — ${current} unread now.`
+    );
+  }
+  if (current > previousCount) {
+    const added = current - previousCount;
+    return (
+      `Since the last run (${previousDate}), the pile grew by ${added} — ` +
+      `${current} unread now.`
+    );
+  }
+  return `No change since the last run (${previousDate}) — still ${current} unread.`;
 }
 
 interface BacklogFacts {
@@ -1044,11 +1308,14 @@ function buildBacklogBlock(scan: BacklogScan): string {
     if (scan.readCount > 0) {
       lines.push('', `${scan.readCount} clipping${scan.readCount === 1 ? '' : 's'} already marked read.`);
     }
+    // The pile being empty is itself the progress worth reporting.
+    if (scan.progressLine) lines.push('', scan.progressLine);
     return lines.join('\n');
   }
 
   const total = scan.items.length + scan.omitted;
   lines.push(`${total} unread clipping${total === 1 ? '' : 's'} in ${scan.foldersLabel}.`);
+  if (scan.progressLine) lines.push(scan.progressLine);
 
   const counts = BACKLOG_BUCKET_ORDER.map((bucket) => {
     const n = scan.items.filter((item) => item.bucket === bucket).length;
@@ -1330,6 +1597,143 @@ class ChoiceModal<T> extends Modal {
   }
 }
 
+interface SweepModalConfig {
+  /** Scope choices: '' is the whole vault, anything else a folder path. */
+  scopes: Array<{ folder: string; label: string }>;
+  /** Runs the dry run for a chosen scope. Resolves with the plan to review. */
+  chooseScope: (folder: string) => Promise<SweepPlan>;
+  /** Applies the approved entries. Only ever called from the confirm button. */
+  onApply: (chosen: SweepPlanEntry[]) => void;
+}
+
+/**
+ * Two-phase review for the housekeeping sweep. Phase one picks the scope;
+ * phase two shows the dry run - one row per note, its proposed tags beside
+ * it - and writes NOTHING: the only path to a write is the confirm button
+ * at the bottom of phase two, and it applies exactly the rows still
+ * ticked. Closing the modal at either phase changes no note.
+ */
+class SweepModal extends Modal {
+  private readonly config: SweepModalConfig;
+  private plan: SweepPlan | null = null;
+  private readonly selected = new Set<number>();
+
+  constructor(app: App, config: SweepModalConfig) {
+    super(app);
+    this.config = config;
+  }
+
+  onOpen(): void {
+    this.renderScopePhase();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+
+  private renderScopePhase(): void {
+    const { contentEl, titleEl } = this;
+    titleEl.setText('Housekeeping sweep');
+    contentEl.empty();
+
+    contentEl.createEl('p', {
+      text:
+        'Pick a scope to scan for tag suggestions. You will review every ' +
+        'proposed change before anything is written - the scan itself ' +
+        'changes nothing.',
+    });
+
+    const list = contentEl.createDiv({ cls: 'ehm-suggestion-list' });
+    for (const scope of this.config.scopes) {
+      const button = list.createEl('button', { text: scope.label });
+      button.addEventListener('click', () => {
+        void this.pickScope(scope.folder);
+      });
+    }
+
+    const buttons = contentEl.createDiv({ cls: 'ehm-modal-buttons' });
+    const cancel = buttons.createEl('button', { text: 'Cancel' });
+    cancel.addEventListener('click', () => this.close());
+  }
+
+  private async pickScope(folder: string): Promise<void> {
+    const { contentEl } = this;
+    contentEl.empty();
+    contentEl.createEl('p', { text: 'Scanning...' });
+
+    this.plan = await this.config.chooseScope(folder);
+    this.selected.clear();
+    this.plan.entries.forEach((_entry, i) => this.selected.add(i));
+    this.renderReviewPhase();
+  }
+
+  private renderReviewPhase(): void {
+    const plan = this.plan;
+    if (!plan) return;
+
+    const { contentEl, titleEl } = this;
+    titleEl.setText('Housekeeping sweep — review');
+    contentEl.empty();
+
+    const intro: string[] = [
+      `Scanned ${plan.scanned} note${plan.scanned === 1 ? '' : 's'} in ${plan.scopeLabel}. ` +
+        `${plan.entries.length} would gain tags; ${plan.unchanged} needed none.`,
+    ];
+    if (plan.omitted > 0) {
+      intro.push(
+        `${plan.omitted} more note${plan.omitted === 1 ? '' : 's'} were not scanned - ` +
+          `one run covers at most ${SWEEP_MAX_NOTES}. Narrow the scope or run again after applying.`
+      );
+    }
+    contentEl.createEl('p', { text: intro.join(' ') });
+
+    if (plan.entries.length === 0) {
+      contentEl.createEl('p', { text: 'No tag changes to propose in this scope.' });
+      const buttons = contentEl.createDiv({ cls: 'ehm-modal-buttons' });
+      const close = buttons.createEl('button', { cls: 'mod-cta', text: 'Close' });
+      close.addEventListener('click', () => this.close());
+      return;
+    }
+
+    const list = contentEl.createDiv({ cls: 'ehm-suggestion-list' });
+    plan.entries.forEach((entry, index) => {
+      const row = list.createEl('label', { cls: 'ehm-suggestion-row' });
+
+      const checkbox = row.createEl('input', { attr: { type: 'checkbox' } });
+      checkbox.checked = true;
+      checkbox.addEventListener('change', () => {
+        if (checkbox.checked) this.selected.add(index);
+        else this.selected.delete(index);
+      });
+
+      row.createSpan({ text: entry.basename });
+      row.createEl('small', {
+        cls: 'ehm-suggestion-meta',
+        text: `${entry.tags.map((t) => `#${t}`).join(' ')} · ${entry.path}`,
+      });
+    });
+
+    contentEl.createEl('p', {
+      text: 'Applying writes only frontmatter tag merges - note bodies are never touched.',
+    });
+
+    const buttons = contentEl.createDiv({ cls: 'ehm-modal-buttons' });
+
+    const cancel = buttons.createEl('button', { text: 'Cancel' });
+    cancel.addEventListener('click', () => this.close());
+
+    const apply = buttons.createEl('button', {
+      cls: 'mod-cta',
+      text: 'Apply tags to selected notes',
+    });
+    apply.addEventListener('click', () => {
+      const chosen = plan.entries.filter((_entry, i) => this.selected.has(i));
+      this.close();
+      this.config.onApply(chosen);
+    });
+  }
+}
+
 /* ========================================================================== */
 /*                                   plugin                                   */
 /* ========================================================================== */
@@ -1405,6 +1809,14 @@ export default class EliasHiveMindPlugin extends Plugin {
       name: 'Suggest links for current note',
       editorCallback: (editor: Editor, view: MarkdownView) => {
         void this.runLinkSuggestions(editor, view);
+      },
+    });
+
+    this.addCommand({
+      id: 'housekeeping-sweep',
+      name: 'Housekeeping sweep: suggest tags for a folder or the vault',
+      callback: () => {
+        this.runHousekeepingSweep();
       },
     });
 
@@ -1612,12 +2024,22 @@ export default class EliasHiveMindPlugin extends Plugin {
           `Elias HiveMind: backend unavailable (${message}). Using local tags instead.`,
           10000
         );
-        tags = suggestTagsLocally(markdown, this.settings.maxTags, existing);
+        tags = suggestTagsLocally(
+          markdown,
+          this.settings.maxTags,
+          existing,
+          buildTagVocabulary(this.app)
+        );
       } finally {
         pending.hide();
       }
     } else {
-      tags = suggestTagsLocally(markdown, this.settings.maxTags, existing);
+      tags = suggestTagsLocally(
+        markdown,
+        this.settings.maxTags,
+        existing,
+        buildTagVocabulary(this.app)
+      );
     }
 
     if (tags.length === 0) {
@@ -1646,6 +2068,112 @@ export default class EliasHiveMindPlugin extends Plugin {
     const oldLines = oldHead.split('\n');
     const end = { line: oldLines.length - 1, ch: oldLines[oldLines.length - 1].length };
     editor.replaceRange(newHead, { line: 0, ch: 0 }, end);
+  }
+
+  /* --------------------------------------------------------- housekeeping */
+
+  /**
+   * Opens the sweep: scope picker first, dry run second, writes only from
+   * the review's confirm button. The vocabulary is built once here and
+   * shared by every scope the user tries in this session.
+   */
+  private runHousekeepingSweep(): void {
+    const vocabulary = buildTagVocabulary(this.app);
+    const scopes = [
+      { folder: '', label: 'Whole vault' },
+      ...sweepFolderOptions(this.app).map((folder) => ({ folder, label: folder })),
+    ];
+
+    new SweepModal(this.app, {
+      scopes,
+      chooseScope: (folder) => this.planSweep(folder, vocabulary),
+      onApply: (chosen) => {
+        void this.applySweepEntries(chosen);
+      },
+    }).open();
+  }
+
+  /**
+   * The sweep's dry run over one scope ('' = whole vault; a folder covers
+   * its subfolders). Same exclusions as everywhere else - the
+   * configuration folder and the user's ignored folders - plus the digest
+   * note. Reads at most SWEEP_MAX_NOTES notes, in path order; the rest
+   * are counted, never silently skipped. Proposes tags only: this
+   * function writes nothing.
+   */
+  private async planSweep(folder: string, vocabulary: TagVocabulary): Promise<SweepPlan> {
+    const ignored = parseIgnoreFolders(
+      `${this.app.vault.configDir}, ${this.settings.ignoreFolders}`
+    );
+    const prefix = folder ? folder.toLowerCase() + '/' : '';
+
+    const inScope = this.app.vault
+      .getMarkdownFiles()
+      .filter((file) => {
+        if (file.path === DIGEST_NOTE_PATH) return false;
+        const lower = file.path.toLowerCase();
+        if (prefix && !lower.startsWith(prefix)) return false;
+        return !ignored.some((f) => lower.startsWith(f + '/'));
+      })
+      .sort((a, b) => a.path.localeCompare(b.path));
+
+    const plan: SweepPlan = {
+      entries: [],
+      scanned: 0,
+      omitted: Math.max(0, inScope.length - SWEEP_MAX_NOTES),
+      unchanged: 0,
+      scopeLabel: folder ? `folder "${folder}"` : 'the whole vault',
+    };
+
+    for (const file of inScope.slice(0, SWEEP_MAX_NOTES)) {
+      const markdown = await this.app.vault.cachedRead(file);
+      plan.scanned += 1;
+      const tags = suggestTagsLocally(
+        markdown,
+        this.settings.maxTags,
+        existingFrontmatterTags(markdown),
+        vocabulary
+      );
+      if (tags.length > 0) {
+        plan.entries.push({ file, basename: file.basename, path: file.path, tags });
+      } else {
+        plan.unchanged += 1;
+      }
+    }
+
+    return plan;
+  }
+
+  /**
+   * Applies an approved sweep plan: for each approved note, the proposed
+   * tags are merged into its frontmatter via the same head-splice the
+   * backlog tag command uses - the note is re-read at apply time and only
+   * its frontmatter head is replaced, so bodies are never rewritten.
+   */
+  private async applySweepEntries(chosen: SweepPlanEntry[]): Promise<void> {
+    if (chosen.length === 0) {
+      new Notice('Elias HiveMind: sweep applied to no notes - nothing was ticked.');
+      return;
+    }
+
+    let applied = 0;
+    for (const entry of chosen) {
+      try {
+        const current = await this.app.vault.read(entry.file);
+        const { oldHead, newHead } = mergeTagsIntoFrontmatter(current, entry.tags);
+        await this.app.vault.modify(entry.file, newHead + current.slice(oldHead.length));
+        applied += 1;
+      } catch (error) {
+        console.error(`Elias HiveMind sweep error on ${entry.path}`, error);
+      }
+    }
+
+    new Notice(
+      applied > 0
+        ? `Elias HiveMind: sweep added tags to ${applied} note${applied === 1 ? '' : 's'}.`
+        : 'Elias HiveMind: sweep could not update any of the selected notes.',
+      8000
+    );
   }
 
   /* -------------------------------------------------------------- linking */
@@ -1748,7 +2276,12 @@ export default class EliasHiveMindPlugin extends Plugin {
         date,
         formatDigestDate(new Date(cutoff)),
         entries,
-        suggestTagsLocally(combined.join('\n\n'), this.settings.maxTags, existingTags),
+        suggestTagsLocally(
+          combined.join('\n\n'),
+          this.settings.maxTags,
+          existingTags,
+          buildTagVocabulary(this.app)
+        ),
         week.length - shown.length
       );
 
@@ -1810,6 +2343,7 @@ export default class EliasHiveMindPlugin extends Plugin {
       readCount: 0,
       foldersLabel: backlogFolderLabel(settings.backlogFolders),
       themes: '',
+      progressLine: '',
     };
     if (tagSet.size > 0) {
       scan.foldersLabel += `, or tagged ${Array.from(tagSet)
@@ -1834,6 +2368,11 @@ export default class EliasHiveMindPlugin extends Plugin {
         (archive !== '' && (lower === archive || lower.startsWith(archive + '/')))
       );
     };
+
+    // The vault's tag vocabulary, built once per scan from the metadata
+    // cache, so every item's tag suggestions prefer the tags (and the
+    // spelling) the vault already uses.
+    const vocabulary = buildTagVocabulary(this.app);
 
     const all = this.app.vault.getMarkdownFiles();
     const candidates = all
@@ -1964,7 +2503,12 @@ export default class EliasHiveMindPlugin extends Plugin {
         basename: file.basename,
         path: file.path,
         summary: summariseLocally(markdown, Math.min(3, settings.summarySentenceCount)),
-        tags: suggestTagsLocally(markdown, settings.maxTags, existingFrontmatterTags(markdown)),
+        tags: suggestTagsLocally(
+          markdown,
+          settings.maxTags,
+          existingFrontmatterTags(markdown),
+          vocabulary
+        ),
         readMinutes: estimateReadMinutes(wordCount),
         ageDays,
         wordCount,
@@ -1976,6 +2520,24 @@ export default class EliasHiveMindPlugin extends Plugin {
     }
 
     scan.items.sort(compareBacklogItems);
+
+    // The progress line compares this scan's pile against the previous
+    // scan's, then this scan becomes the baseline for the next one. The
+    // baseline lives in the settings object (the plugin's one storage
+    // slot) and is written even when the pile is empty - an emptied pile
+    // is exactly the progress the next run should be able to report.
+    const totalUnread = scan.items.length + scan.omitted;
+    scan.progressLine = backlogProgressLine(
+      settings.backlogLastUnread,
+      settings.backlogLastRunDate,
+      totalUnread
+    );
+    const today = formatDigestDate(now);
+    if (settings.backlogLastUnread !== totalUnread || settings.backlogLastRunDate !== today) {
+      settings.backlogLastUnread = totalUnread;
+      settings.backlogLastRunDate = today;
+      void this.saveSettings();
+    }
 
     // Optional, opt-in: a backend pass that groups the pile into themes.
     // Best-effort only - any failure leaves the fully local digest standing,
@@ -2072,7 +2634,8 @@ export default class EliasHiveMindPlugin extends Plugin {
     const tags = suggestTagsLocally(
       markdown,
       this.settings.maxTags,
-      existingFrontmatterTags(markdown)
+      existingFrontmatterTags(markdown),
+      buildTagVocabulary(this.app)
     );
     if (tags.length === 0) {
       new Notice('Elias HiveMind: no new tags found for this clipping.');

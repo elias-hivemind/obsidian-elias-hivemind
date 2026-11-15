@@ -3,6 +3,35 @@
 All notable changes to Elias HiveMind. Versions match `manifest.json`; each
 release is cut from the tag of the same name (no `v` prefix).
 
+## 1.3.0
+
+- **Vault-aware local tag suggestions.** The local tagger now reads the
+  vault's existing tag vocabulary from the metadata cache (frontmatter and
+  inline tags, counted per note — no note content is read) and prefers it
+  over words it would otherwise invent: a candidate that matches an
+  established tag is suggested in the form the vault writes it, casing
+  included, and a candidate matching the last part of a nested tag
+  suggests the full nested tag (`garden/compost`). Established tags rank
+  ahead of new words. This applies everywhere the local tagger runs —
+  the tag commands, the weekly digest's aggregate tags, the Backlog
+  digest's per-item tags and the backlog apply-tags command. The backend
+  tag path is unchanged.
+- **New: Housekeeping sweep.** A new command, **Housekeeping sweep:
+  suggest tags for a folder or the vault**, runs the local tagger over a
+  scope you pick — the whole vault, or a folder including its subfolders —
+  and presents a dry-run review: one row per note with the tags it would
+  gain, for you to tick or untick. Nothing is written until you confirm,
+  and applying writes frontmatter tag merges only — note bodies are never
+  touched. At most 50 notes are scanned per run, in path order; the rest
+  are counted in the review. The configuration folder, ignored folders
+  and the digest note are excluded.
+- **Backlog progress line.** From the second backlog scan on, the
+  **Your backlog** section opens with a one-line progress report — how
+  many clippings left the pile since the last run, or that it grew, or
+  that nothing changed. The plugin remembers the previous run's unread
+  count and date between runs; the first scan sets the baseline and shows
+  no line.
+
 ## 1.2.0
 
 - **New: Backlog digest.** A new command, **Backlog digest**, scans the
