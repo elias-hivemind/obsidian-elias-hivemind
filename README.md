@@ -5,7 +5,7 @@ Summaries, tag suggestions and link suggestions for Obsidian, working offline by
 New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language steps from install to your first Backlog Digest.
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.2.0
+- **Version:** 1.4.0
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -102,6 +102,16 @@ Saved articles pile up in a clippings folder and are never read. The backlog dig
 - Processing is one explicit command per clipping, run while the clipping is open: **apply suggested tags** (the usual checklist, written to frontmatter), **link** (the usual unlinked-mention checklist, appended under a `## Suggested links` heading), **mark as read** (writes a `hivemind-read: true` frontmatter property; marked clippings drop out of later digests), or **archive** (moves the clipping into the archive folder, default `Archive`, creating it if needed and refusing rather than overwriting a same-named note). The digest itself only links to each clipping — opening the link is the tap. **The plugin never deletes anything, and never moves or marks a note on its own.**
 - Optionally, with *Backlog themes via backend* switched on, a digest run also asks your configured backend to group the clippings into cross-article themes. It is off by default and best-effort: if the backend is unreachable the local digest is written without themes.
 
+### Resurface forgotten notes
+
+The weekly digest covers what was new this week, and the backlog digest covers clippings never read. **Resurface** covers the third population: notes you read or wrote, then never touched again. Run **Resurface forgotten notes** and the plugin builds the queue itself — no enrolment, no review system to maintain:
+
+- A note is a candidate once it has been untouched for at least the *Cold threshold (days)* (default 90). The digest note itself, the configuration folder, your ignored folders, and anything the backlog digest would count as unread backlog are excluded, so the two features never double-count a note.
+- Candidates are ranked by coldness (how long untouched) × connectedness (how many notes link to it, from the metadata cache) × relevance (tags and vocabulary shared with the notes you edited in the last 30 days). The same vault always produces the same ranking.
+- The review modal shows the top notes (default 5, *Resurface queue size*) — each with how long it has been untouched and a plain-words line saying why it ranked, composed only from factors that are true of it: *untouched 7 months · linked from 6 notes · shares #compost with 3 notes you edited this month*. Clauses that are not true are omitted.
+- Per note you can **Open** it, **Snooze** it (hidden for 30 days; each later snooze of the same note doubles the interval — 60 days, then 120), or choose **Never show**. Snoozing and dismissing write only the plugin's own data — no note file is ever changed by them.
+- With *Resurface section in weekly digest* on (the default), each weekly digest also carries a **Worth another look** list of the top 3. Switch it off and the digest is exactly what it was before. If nothing has gone cold yet, the modal says so plainly and the digest gains no section.
+
 ---
 
 ## Privacy
@@ -111,6 +121,7 @@ Saved articles pile up in a clippings folder and are never read. The backlog dig
 - **Weekly digest (local)** reads the notes created or modified in the last seven days (their content, to summarize them), only when you run the command. The only thing it writes is the digest note, inside your vault.
 - **Backlog digest** reads the clippings in your backlog folders or carrying a backlog tag (their content, to summarize and classify them) and the notes you touched in the last seven days (to judge relevance), only when you run a digest command. Tag-based selection reads only the metadata cache's tag list, never file content. It writes only the digest note. The four **Backlog:** processing commands write or move only the one note you run them on — a tag merge, appended links, a `hivemind-read: true` frontmatter marker, or a move into your archive folder — and only when you run them.
 - **Housekeeping sweep** reads the notes in the scope you pick (their content, to compute tag suggestions) only when you run the command and choose that scope, and writes only the frontmatter tag merges you approve in its review — nothing is written by the scan itself. Vault-aware tag suggestions additionally read the metadata cache's tag list for the whole vault, never note content.
+- **Resurface forgotten notes** reads note modification times, the metadata cache's link map and tag list, and — only when you run the command or a digest — the content of cold notes and of notes touched in the last 30 days, to judge relevance. It makes no network requests. Snoozing or dismissing a note writes only the plugin's own data file; no note is changed.
 - **Backlog themes**, only if you switch *Backlog themes via backend* on, sends the clippings' titles and summaries (not their full text) to the **Backend URL** you configure — the same local server as the other backend commands. With the setting off, no backlog request is ever made.
 - **Backend commands** send the note's plain text, with frontmatter and code blocks removed, to the **Backend URL** you configure. The default is `http://127.0.0.1:11434/api/generate`, a local Ollama server, so the text doesn't leave your computer unless you change that URL.
 - **Opening the settings tab** sends one request to the same server for its list of installed models. No note content is included.
@@ -279,6 +290,7 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 | Housekeeping sweep: suggest tags for a folder or the vault | None | Dry-runs the local tagger over a folder (subfolders included) or the whole vault, at most 50 notes per run; you review every proposed change and approve per note before anything is written. Writes frontmatter tag merges only. |
 | Weekly digest (local) | None | Summarizes the notes created or modified in the last seven days into `Weekly Digest.md`. |
 | Backlog digest | None¹ | Digests the unread clippings in your backlog folders (or carrying a backlog tag) into the "Your backlog" section of `Weekly Digest.md`: summary, tags, read time, age, bucketed by relevance. |
+| Resurface forgotten notes | None | Opens a review of the notes that have gone cold — untouched past the cold threshold, ranked by backlinks and overlap with your last 30 days of notes — to open, snooze or dismiss. The weekly digest carries the top 3 as "Worth another look". |
 | Backlog: apply suggested tags to current note | None | Suggests tags for the open clipping and merges the ones you pick into its frontmatter. Only on a backlog clipping. |
 | Backlog: link current note to the notes it mentions | None | Appends the unlinked mentions you pick to the open clipping under a `## Suggested links` heading. Only on a backlog clipping. |
 | Backlog: mark current note as read | None | Writes `hivemind-read: true` into the open clipping's frontmatter, so it drops out of later digests. Only on a backlog clipping. |
@@ -332,6 +344,16 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 | Stale after (days) | `30` | A clipping untouched for this many days (7–180), with no overlap with your recent notes, is listed as gone stale. |
 | Archive folder | `Archive` | Folder the *Backlog: archive current note* command moves a clipping into. Clippings already inside it are excluded from digests. |
 | Backlog themes via backend | Off | Also ask your backend to group each digest's clippings into themes. Best-effort; the digest itself never needs it. |
+
+### Resurface
+
+| Setting | Default | Description |
+|---|---|---|
+| Cold threshold (days) | `90` | A note untouched for at least this many days (7–365) counts as gone cold and can be resurfaced. |
+| Resurface queue size | `5` | How many forgotten notes the *Resurface forgotten notes* command shows at once (1–20). |
+| Resurface section in weekly digest | On | Each weekly digest carries a *Worth another look* list of the three highest-ranked cold notes. |
+
+Snooze records and the never-show list are stored in the plugin's own `data.json`, like the backlog's progress baseline; they have no settings-tab control and never touch a note.
 
 ### Prompts (no settings-tab control)
 

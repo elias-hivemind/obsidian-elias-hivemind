@@ -133,9 +133,14 @@ declare module 'obsidian' {
 
   /* ------------------------------------------------------------- workspace */
 
+  export class WorkspaceLeaf {
+    openFile(file: TFile): Promise<void>;
+  }
+
   export class Workspace {
     getActiveFile(): TFile | null;
     getActiveViewOfType<T extends View>(type: new (...args: never[]) => T): T | null;
+    getLeaf(newLeaf?: boolean): WorkspaceLeaf;
   }
 
   /* ------------------------------------------------------------------- app */

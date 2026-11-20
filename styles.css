@@ -43,3 +43,23 @@
   justify-content: flex-end;
   gap: 0.5em;
 }
+
+/* One resurfaced note in the review modal: title and why-line, actions right. */
+.ehm-resurface-row {
+  display: flex;
+  align-items: center;
+  gap: 0.6em;
+  padding: 0.35em 0;
+}
+
+/* Title stacked above the muted why-line, taking the row's free space. */
+.ehm-resurface-main {
+  display: flex;
+  flex-direction: column;
+  margin-right: auto;
+}
+
+/* Why this note resurfaced, in the user's muted text colour. */
+.ehm-resurface-why {
+  color: var(--text-muted);
+}

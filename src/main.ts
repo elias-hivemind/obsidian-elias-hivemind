@@ -44,6 +44,15 @@
  *       that note. An optional backend pass can add cross-item themes, but
  *       only when the user switches it on.
  *
+ *   Resurface
+ *     - local only: finds notes that were read or written and then went
+ *       cold - untouched past a threshold the user sets - and ranks them by
+ *       how connected and relevant they still are (backlinks from the
+ *       metadata cache, tags and vocabulary shared with the last 30 days of
+ *       notes). A command shows the top few in a review modal; the weekly
+ *       digest can carry the top three. Snoozing or dismissing a note
+ *       writes only plugin-internal state, never a note file.
+ *
  * Obsidian loads this file as CommonJS and instantiates the default export.
  */
 
@@ -100,6 +109,21 @@ interface EliasHiveMindSettings {
    */
   backlogLastUnread: number;
   backlogLastRunDate: string;
+  /** Days a note must go untouched before Resurface counts it as cold. */
+  resurfaceColdDays: number;
+  /** How many forgotten notes the Resurface command shows at once. */
+  resurfaceQueueSize: number;
+  /** Whether the weekly digest carries a "Worth another look" section. */
+  resurfaceInDigest: boolean;
+  /**
+   * Internal state, not user settings (no settings-tab controls), following
+   * the backlogLastUnread precedent: per-path snooze records written by the
+   * Resurface modal. `until` is an ISO timestamp; `count` is how many times
+   * the note has been snoozed, which drives the doubling interval.
+   */
+  resurfaceSnoozes: Record<string, ResurfaceSnooze>;
+  /** Internal state: paths the user chose to never resurface again. */
+  resurfaceNeverShow: string[];
 }
 
 const DEFAULT_SETTINGS: EliasHiveMindSettings = {
@@ -129,6 +153,11 @@ const DEFAULT_SETTINGS: EliasHiveMindSettings = {
   backlogThemesViaBackend: false,
   backlogLastUnread: -1,
   backlogLastRunDate: '',
+  resurfaceColdDays: 90,
+  resurfaceQueueSize: 5,
+  resurfaceInDigest: true,
+  resurfaceSnoozes: {},
+  resurfaceNeverShow: [],
 };
 
 /* ========================================================================== */
@@ -1475,6 +1504,248 @@ function withFrontmatterValue(
   return { oldHead: block ? block.text : '', newHead: ['---', ...lines, '---'].join(eol) + eol };
 }
 
+/* ========================================================================== */
+/*                               resurface                                    */
+/* ========================================================================== */
+
+/**
+ * Resurface covers the third population of a note's life. The weekly digest
+ * covers what was new this week and the backlog digest covers clippings
+ * never read; Resurface covers notes that were read or written, then went
+ * cold. Candidates are ranked by coldness x connectedness x relevance, all
+ * computed locally: file mtimes, backlink counts from the metadata cache,
+ * and tag/word overlap with the notes touched in the last 30 days. There
+ * is no enrolment and no background pass - the ranking is recomputed on
+ * each explicit command or digest run, and note content is read only
+ * during such a run (for the word-overlap term), mirroring the backlog
+ * digest. Snoozing and dismissing write only the plugin's own data.
+ */
+
+/** How far back "notes you edited this month" reaches, for relevance. */
+const RESURFACE_RECENT_WINDOW_MS = 30 * BACKLOG_DAY_MS;
+
+/** Snooze interval for a first snooze; each later snooze doubles it. */
+const RESURFACE_SNOOZE_BASE_DAYS = 30;
+
+/** One note's snooze record, persisted in the plugin's own data. */
+interface ResurfaceSnooze {
+  /** ISO timestamp at which the note may resurface again. */
+  until: string;
+  /** How many times the note has been snoozed (drives the doubling). */
+  count: number;
+}
+
+/** The measured facts behind one resurfaced note's rank and why-line. */
+interface ResurfaceFacts {
+  /** Whole days since the note was last modified. */
+  ageDays: number;
+  /** Distinct notes linking to this one, from the metadata cache. */
+  backlinks: number;
+  /** Canonical form of the strongest tag shared with recent notes. */
+  sharedTag: string | null;
+  /** How many recent notes carry that shared tag. */
+  sharedTagNotes: number;
+  /** Significant words shared with the recent notes' vocabulary. */
+  wordOverlap: number;
+}
+
+/** One ranked forgotten note, ready for the modal or the digest. */
+interface ResurfaceItem extends ResurfaceFacts {
+  basename: string;
+  path: string;
+  score: number;
+  /** Plain-words explanation, composed only from true factors. */
+  why: string;
+}
+
+/**
+ * Counts the distinct notes that link to `path`, from the metadata cache's
+ * resolvedLinks (source path -> destination path -> link count). A note
+ * never counts as its own backlink. Cache only - no content is read.
+ */
+function countBacklinks(
+  resolvedLinks: Record<string, Record<string, number>>,
+  path: string
+): number {
+  let count = 0;
+  for (const source of Object.keys(resolvedLinks ?? {})) {
+    if (source === path) continue;
+    const destinations = resolvedLinks[source];
+    if (destinations && (destinations[path] ?? 0) > 0) count += 1;
+  }
+  return count;
+}
+
+/**
+ * The deterministic Resurface score: coldness (log of days untouched, so
+ * extreme age alone cannot swamp the other terms) x connectedness
+ * (1 + backlinks) x relevance (1 + shared-tag strength + word overlap,
+ * each capped so one loud signal cannot dominate). The same facts always
+ * produce the same score.
+ */
+function scoreResurfaceCandidate(facts: ResurfaceFacts): number {
+  const coldness = Math.log(Math.max(1, facts.ageDays));
+  const connectedness = 1 + facts.backlinks;
+  const relevance =
+    1 + Math.min(facts.sharedTagNotes, 5) + Math.min(facts.wordOverlap, 10) * 0.2;
+  return coldness * connectedness * relevance;
+}
+
+/** "untouched 6 months" / "untouched 45 days" / "untouched 1 year 2 months". */
+function formatUntouched(ageDays: number): string {
+  if (ageDays < 60) return `untouched ${ageDays} day${ageDays === 1 ? '' : 's'}`;
+  const months = Math.floor(ageDays / 30);
+  if (months < 12) return `untouched ${months} month${months === 1 ? '' : 's'}`;
+  const years = Math.floor(months / 12);
+  const rest = months % 12;
+  const yearPart = `${years} year${years === 1 ? '' : 's'}`;
+  return rest > 0
+    ? `untouched ${yearPart} ${rest} month${rest === 1 ? '' : 's'}`
+    : `untouched ${yearPart}`;
+}
+
+/**
+ * The why-line for one resurfaced note, composed only from factors that
+ * are actually true of it: zero-value clauses are omitted entirely, so an
+ * orphan with no recent overlap is introduced by its age alone.
+ */
+function buildResurfaceWhy(facts: ResurfaceFacts): string {
+  const parts: string[] = [formatUntouched(facts.ageDays)];
+  if (facts.backlinks > 0) {
+    parts.push(`linked from ${facts.backlinks} note${facts.backlinks === 1 ? '' : 's'}`);
+  }
+  if (facts.sharedTag && facts.sharedTagNotes > 0) {
+    parts.push(
+      `shares #${facts.sharedTag} with ${facts.sharedTagNotes} note${facts.sharedTagNotes === 1 ? '' : 's'} you edited this month`
+    );
+  } else if (facts.wordOverlap > 0) {
+    parts.push(
+      `shares ${facts.wordOverlap} significant word${facts.wordOverlap === 1 ? '' : 's'} with notes you edited this month`
+    );
+  }
+  return parts.join(' · ');
+}
+
+/** Rank order: score, then coldest, then path - fully deterministic. */
+function compareResurfaceItems(a: ResurfaceItem, b: ResurfaceItem): number {
+  return b.score - a.score || b.ageDays - a.ageDays || a.path.localeCompare(b.path);
+}
+
+/**
+ * The snooze record after one more snooze of a note: the interval is
+ * 30 days x 2^(count-1) - 30 days the first time, then 60, 120, and so on.
+ */
+function nextResurfaceSnooze(
+  existing: ResurfaceSnooze | undefined,
+  nowMs: number
+): ResurfaceSnooze {
+  const count = (existing?.count ?? 0) + 1;
+  const days = RESURFACE_SNOOZE_BASE_DAYS * Math.pow(2, count - 1);
+  return { until: new Date(nowMs + days * BACKLOG_DAY_MS).toISOString(), count };
+}
+
+/** True when a note is never-listed, or snoozed and the snooze still runs. */
+function isResurfaceSuppressed(
+  path: string,
+  snoozes: Record<string, ResurfaceSnooze>,
+  neverShow: string[],
+  nowMs: number
+): boolean {
+  if (neverShow.includes(path)) return true;
+  const snooze = snoozes ? snoozes[path] : undefined;
+  if (!snooze) return false;
+  const until = Date.parse(snooze.until);
+  return Number.isFinite(until) && until > nowMs;
+}
+
+/**
+ * True when the backlog digest's own selection would pick this note up as
+ * unread backlog - in a backlog folder or carrying a backlog tag, and not
+ * marked read. Mirrors collectBacklog's selection (including its archive
+ * exclusion) so the two features never double-count a note: Resurface
+ * leaves unread backlog to the backlog digest. The read marker is proven
+ * from the metadata cache where possible; `markdown` (read during the
+ * caller's explicit run) settles it otherwise.
+ */
+function isUnreadBacklogSelection(
+  app: App,
+  file: TFile,
+  folders: string[],
+  tagSet: Set<string>,
+  archiveFolder: string,
+  markdown: string | null
+): boolean {
+  const lower = file.path.toLowerCase();
+  if (archiveFolder !== '' && (lower === archiveFolder || lower.startsWith(archiveFolder + '/'))) {
+    return false;
+  }
+  const inScope =
+    fileInAnyFolder(file.path, folders) ||
+    (tagSet.size > 0 && fileTags(app, file).some((t) => tagSet.has(t)));
+  if (!inScope) return false;
+
+  const cache = app.metadataCache.getFileCache(file);
+  const cached = cache?.frontmatter ? cache.frontmatter[BACKLOG_READ_KEY] : undefined;
+  if (cached === true || cached === 'true') return false;
+  if (markdown !== null && isMarkedRead(markdown)) return false;
+  return true;
+}
+
+/** Assembles the digest's "Worth another look" block, no trailing newline. */
+function buildResurfaceBlock(items: ResurfaceItem[]): string {
+  const lines: string[] = ['### Worth another look', ''];
+  for (const item of items) {
+    lines.push(`- [[${item.basename}]] — ${item.why}`);
+  }
+  lines.push(
+    '',
+    '*Forgotten notes, ranked by how connected and relevant they still are. ' +
+      'Run "Resurface forgotten notes" to open, snooze or dismiss them.*'
+  );
+  return lines.join('\n');
+}
+
+/**
+ * Returns the note text with the resurface block for `date` inserted or
+ * replaced - the same placement rules as the backlog block: the block
+ * lives inside that date's weekly digest section, is swapped in place when
+ * the section already holds one, appended to the section when it does not,
+ * and a section holding only the block is created when the date has none.
+ */
+function upsertResurfaceBlock(existing: string, block: string, date: string): string {
+  const heading = `## Weekly Digest — ${date}`;
+  const start = existing.indexOf(heading);
+
+  if (start === -1) {
+    return upsertDigestSection(existing, `${heading}\n\n${block}`, date);
+  }
+
+  const rest = existing.slice(start + heading.length);
+  const nextSection = rest.indexOf('\n## ');
+  const sectionEnd =
+    nextSection === -1 ? existing.length : start + heading.length + nextSection + 1;
+  const section = existing.slice(start, sectionEnd);
+
+  const marker = '### Worth another look';
+  const blockStart = section.indexOf(marker);
+  let newSection: string;
+
+  if (blockStart === -1) {
+    newSection = `${section.replace(/\n+$/, '')}\n\n${block}\n`;
+  } else {
+    const after = section.slice(blockStart + marker.length);
+    const nextSub = after.search(/\n#{2,3} /);
+    const blockEnd =
+      nextSub === -1 ? section.length : blockStart + marker.length + nextSub + 1;
+    newSection =
+      blockEnd < section.length
+        ? `${section.slice(0, blockStart)}${block}\n\n${section.slice(blockEnd)}`
+        : `${section.slice(0, blockStart)}${block}\n`;
+  }
+
+  return existing.slice(0, start) + newSection + existing.slice(sectionEnd);
+}
+
 /**
  * Locates an existing summary block in a note: the line carrying the
  * configured summary heading, plus everything up to the next heading or the
@@ -1738,6 +2009,106 @@ class SweepModal extends Modal {
 /*                                   plugin                                   */
 /* ========================================================================== */
 
+interface ResurfaceModalConfig {
+  /** The ranked queue to review, already sliced to the queue size. */
+  items: ResurfaceItem[];
+  /** Plain statement shown when nothing has gone cold. */
+  emptyText: string;
+  /** Opens the note in the workspace. The modal closes first. */
+  onOpen: (item: ResurfaceItem) => void;
+  /** Snoozes the note (plugin-internal state only) and drops its row. */
+  onSnooze: (item: ResurfaceItem) => void;
+  /** Never shows the note again (plugin-internal state only). */
+  onNever: (item: ResurfaceItem) => void;
+}
+
+/**
+ * Review for Resurface: one row per forgotten note - its title, how long
+ * it has been untouched and why it ranked - with three per-note actions.
+ * Open leaves for the note; Snooze and Never show update only the
+ * plugin's own snooze/exclude state (the callbacks own persistence) and
+ * remove the row. No note file is ever written from this modal.
+ */
+class ResurfaceModal extends Modal {
+  private readonly config: ResurfaceModalConfig;
+  private items: ResurfaceItem[];
+
+  constructor(app: App, config: ResurfaceModalConfig) {
+    super(app);
+    this.config = config;
+    this.items = config.items.slice();
+  }
+
+  onOpen(): void {
+    this.render();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+
+  private render(): void {
+    const { contentEl, titleEl, config } = this;
+    titleEl.setText('Resurface forgotten notes');
+    contentEl.empty();
+
+    if (this.items.length === 0) {
+      contentEl.createEl('p', {
+        text:
+          config.items.length === 0
+            ? config.emptyText
+            : 'All caught up — nothing else has gone cold.',
+      });
+      const buttons = contentEl.createDiv({ cls: 'ehm-modal-buttons' });
+      const close = buttons.createEl('button', { cls: 'mod-cta', text: 'Close' });
+      close.addEventListener('click', () => this.close());
+      return;
+    }
+
+    contentEl.createEl('p', {
+      text:
+        `${this.items.length} forgotten note${this.items.length === 1 ? '' : 's'}, ` +
+        'ranked by how connected and relevant they still are. Snoozing or ' +
+        'dismissing a note changes no note — it only updates this plugin’s own list.',
+    });
+
+    const list = contentEl.createDiv({ cls: 'ehm-suggestion-list' });
+    this.items.forEach((item) => {
+      const row = list.createDiv({ cls: 'ehm-resurface-row' });
+
+      const main = row.createDiv({ cls: 'ehm-resurface-main' });
+      main.createSpan({ text: item.basename });
+      main.createEl('small', { cls: 'ehm-resurface-why', text: item.why });
+
+      const actions = row.createDiv({ cls: 'ehm-modal-buttons' });
+
+      const open = actions.createEl('button', { text: 'Open' });
+      open.addEventListener('click', () => {
+        this.close();
+        config.onOpen(item);
+      });
+
+      const snooze = actions.createEl('button', { text: 'Snooze' });
+      snooze.addEventListener('click', () => {
+        config.onSnooze(item);
+        this.items = this.items.filter((i) => i.path !== item.path);
+        this.render();
+      });
+
+      const never = actions.createEl('button', { text: 'Never show' });
+      never.addEventListener('click', () => {
+        config.onNever(item);
+        this.items = this.items.filter((i) => i.path !== item.path);
+        this.render();
+      });
+    });
+
+    const buttons = contentEl.createDiv({ cls: 'ehm-modal-buttons' });
+    const close = buttons.createEl('button', { cls: 'mod-cta', text: 'Close' });
+    close.addEventListener('click', () => this.close());
+  }
+}
+
 export default class EliasHiveMindPlugin extends Plugin {
   settings: EliasHiveMindSettings = DEFAULT_SETTINGS;
 
@@ -1865,6 +2236,14 @@ export default class EliasHiveMindPlugin extends Plugin {
       name: 'Backlog: link current note to the notes it mentions',
       callback: () => {
         void this.runBacklogLink();
+      },
+    });
+
+    this.addCommand({
+      id: 'resurface-forgotten-notes',
+      name: 'Resurface forgotten notes',
+      callback: () => {
+        void this.runResurface();
       },
     });
 
@@ -2296,8 +2675,27 @@ export default class EliasHiveMindPlugin extends Plugin {
       } catch (backlogError) {
         console.error('Elias HiveMind backlog section error', backlogError);
       }
-      const withBacklog = (text: string): string =>
-        backlogBlock ? upsertBacklogBlock(text, backlogBlock, date) : text;
+      // The dated section also carries the Resurface list, under the same
+      // rules as the backlog section: best-effort (a resurface failure must
+      // not cost the digest), and only when the setting is on and at least
+      // one note has gone cold - with no cold notes (or the toggle off)
+      // the digest text is exactly what it was before Resurface existed.
+      let resurfaceBlock: string | null = null;
+      if (this.settings.resurfaceInDigest) {
+        try {
+          const resurfaced = await this.collectResurface(now);
+          if (resurfaced.length > 0) {
+            resurfaceBlock = buildResurfaceBlock(resurfaced.slice(0, 3));
+          }
+        } catch (resurfaceError) {
+          console.error('Elias HiveMind resurface section error', resurfaceError);
+        }
+      }
+      const withBacklog = (text: string): string => {
+        let out = backlogBlock ? upsertBacklogBlock(text, backlogBlock, date) : text;
+        if (resurfaceBlock) out = upsertResurfaceBlock(out, resurfaceBlock, date);
+        return out;
+      };
 
       const existing = this.app.vault.getAbstractFileByPath(DIGEST_NOTE_PATH);
       if (existing) {
@@ -2560,6 +2958,223 @@ export default class EliasHiveMindPlugin extends Plugin {
     }
 
     return scan;
+  }
+
+  /* ------------------------------------------------------------ resurface */
+
+  /**
+   * Ranks the vault's cold notes for Resurface. Candidates are markdown
+   * notes untouched for at least the cold threshold, excluding the digest
+   * note, the configuration folder, ignored folders, snoozed and
+   * never-listed notes, and the unread backlog population (so the two
+   * digests never double-count). Scoring is metadata-first - mtimes,
+   * resolvedLinks backlink counts and metadata-cache tags; note content
+   * is read only here, during an explicit command or digest run, for the
+   * word-overlap relevance term, mirroring the backlog digest. The full
+   * ranked list is returned; callers slice it (queue size for the modal,
+   * three for the digest).
+   */
+  private async collectResurface(now: Date): Promise<ResurfaceItem[]> {
+    const settings = this.settings;
+    const nowMs = now.getTime();
+    const thresholdDays = Math.max(1, Math.floor(settings.resurfaceColdDays) || 90);
+    const ignored = parseIgnoreFolders(
+      `${this.app.vault.configDir}, ${settings.ignoreFolders}`
+    );
+    const isExcluded = (file: TFile): boolean => {
+      const lower = file.path.toLowerCase();
+      return (
+        file.path === DIGEST_NOTE_PATH ||
+        ignored.some((folder) => lower.startsWith(folder + '/'))
+      );
+    };
+
+    const all = this.app.vault.getMarkdownFiles();
+
+    // The user's last 30 days of work: what a cold note can still be
+    // relevant *to*. Capped like the digests cap their scans.
+    const recentCutoff = nowMs - RESURFACE_RECENT_WINDOW_MS;
+    const recent = all
+      .filter((file) => !isExcluded(file) && file.stat.mtime >= recentCutoff)
+      .sort((a, b) => b.stat.mtime - a.stat.mtime)
+      .slice(0, DIGEST_MAX_NOTES);
+
+    // How many recent notes carry each tag (metadata cache only).
+    const recentTagNotes = new Map<string, number>();
+    for (const file of recent) {
+      for (const tag of fileTags(this.app, file)) {
+        recentTagNotes.set(tag, (recentTagNotes.get(tag) ?? 0) + 1);
+      }
+    }
+
+    // The recent notes' working vocabulary: significant words they use at
+    // least twice between them - the backlog digest's corpus rule.
+    const corpusFreq = new Map<string, number>();
+    for (const file of recent) {
+      for (const word of tokenize(toPlainText(await this.app.vault.cachedRead(file)))) {
+        if (word.length < 4 || STOPWORDS.has(word)) continue;
+        corpusFreq.set(word, (corpusFreq.get(word) ?? 0) + 1);
+      }
+    }
+    const corpus = new Set(
+      Array.from(corpusFreq.keys()).filter((word) => (corpusFreq.get(word) ?? 0) >= 2)
+    );
+
+    const vocabulary = buildTagVocabulary(this.app);
+    const resolvedLinks = this.app.metadataCache.resolvedLinks ?? {};
+    const backlogFolders = parseBacklogFolders(settings.backlogFolders);
+    const backlogTagSet = new Set(parseBacklogTags(settings.backlogTags));
+    const archive = settings.backlogArchiveFolder
+      .trim()
+      .replace(/^\/+|\/+$/g, '')
+      .toLowerCase();
+    const snoozes = settings.resurfaceSnoozes ?? {};
+    const neverShow = settings.resurfaceNeverShow ?? [];
+
+    const items: ResurfaceItem[] = [];
+    for (const file of all) {
+      if (isExcluded(file)) continue;
+
+      const ageDays = Math.floor((nowMs - file.stat.mtime) / BACKLOG_DAY_MS);
+      if (ageDays < thresholdDays) continue;
+      if (isResurfaceSuppressed(file.path, snoozes, neverShow, nowMs)) continue;
+
+      // Unread backlog belongs to the backlog digest. The read marker is
+      // proven from the metadata cache where possible; otherwise the
+      // note's content - read below anyway - settles it.
+      const cache = this.app.metadataCache.getFileCache(file);
+      const cachedRead = cache?.frontmatter
+        ? cache.frontmatter[BACKLOG_READ_KEY]
+        : undefined;
+      const provenRead = cachedRead === true || cachedRead === 'true';
+      let markdown: string | null = null;
+      if (!provenRead) {
+        const inBacklogScope =
+          fileInAnyFolder(file.path, backlogFolders) ||
+          (backlogTagSet.size > 0 &&
+            fileTags(this.app, file).some((t) => backlogTagSet.has(t)));
+        if (inBacklogScope) {
+          markdown = await this.app.vault.cachedRead(file);
+          if (
+            isUnreadBacklogSelection(
+              this.app,
+              file,
+              backlogFolders,
+              backlogTagSet,
+              archive,
+              markdown
+            )
+          ) {
+            continue;
+          }
+        }
+      }
+
+      if (markdown === null) markdown = await this.app.vault.cachedRead(file);
+
+      // The strongest tag this note shares with the recent notes: most
+      // recent notes carrying it wins, the normalised tag breaks ties.
+      let sharedTag: string | null = null;
+      let sharedTagKey = '';
+      let sharedTagNotes = 0;
+      for (const tag of fileTags(this.app, file)) {
+        const count = recentTagNotes.get(tag) ?? 0;
+        if (
+          count > sharedTagNotes ||
+          (count === sharedTagNotes && count > 0 && tag < sharedTagKey)
+        ) {
+          sharedTagNotes = count;
+          sharedTagKey = tag;
+          sharedTag = vocabulary.get(tag)?.canonical ?? tag;
+        }
+      }
+
+      let wordOverlap = 0;
+      significantWordSet(toPlainText(markdown)).forEach((word) => {
+        if (corpus.has(word)) wordOverlap += 1;
+      });
+
+      const facts: ResurfaceFacts = {
+        ageDays,
+        backlinks: countBacklinks(resolvedLinks, file.path),
+        sharedTag,
+        sharedTagNotes,
+        wordOverlap,
+      };
+      items.push({
+        ...facts,
+        basename: file.basename,
+        path: file.path,
+        score: scoreResurfaceCandidate(facts),
+        why: buildResurfaceWhy(facts),
+      });
+    }
+
+    items.sort(compareResurfaceItems);
+    return items;
+  }
+
+  /** Opens the Resurface review modal with the top of the ranked queue. */
+  private async runResurface(): Promise<void> {
+    try {
+      const ranked = await this.collectResurface(new Date());
+      const queueSize = Math.max(1, Math.floor(this.settings.resurfaceQueueSize) || 5);
+      new ResurfaceModal(this.app, {
+        items: ranked.slice(0, queueSize),
+        emptyText:
+          'Nothing has gone cold yet — no note has been untouched for ' +
+          `${Math.max(1, Math.floor(this.settings.resurfaceColdDays) || 90)} days or more.`,
+        onOpen: (item) => {
+          this.openResurfaceItem(item);
+        },
+        onSnooze: (item) => {
+          this.applyResurfaceSnooze(item);
+        },
+        onNever: (item) => {
+          this.applyResurfaceNever(item);
+        },
+      }).open();
+    } catch (error) {
+      console.error('Elias HiveMind resurface error', error);
+      new Notice(`Elias HiveMind: resurface failed. ${describeError(error)}`, 10000);
+    }
+  }
+
+  /** Opens a resurfaced note in the workspace. Reads and writes no content. */
+  private openResurfaceItem(item: ResurfaceItem): void {
+    const file = this.app.vault.getAbstractFileByPath(item.path);
+    if (!file) {
+      new Notice(`Elias HiveMind: "${item.basename}" no longer exists.`);
+      return;
+    }
+    void this.app.workspace.getLeaf(false).openFile(file as TFile);
+  }
+
+  /**
+   * Snoozes a note: only the plugin's own snooze map changes - no note
+   * file is touched. The interval doubles with each snooze of the note.
+   */
+  private applyResurfaceSnooze(item: ResurfaceItem): void {
+    const snoozes = { ...(this.settings.resurfaceSnoozes ?? {}) };
+    const next = nextResurfaceSnooze(snoozes[item.path], Date.now());
+    snoozes[item.path] = next;
+    this.settings.resurfaceSnoozes = snoozes;
+    void this.saveSettings();
+    const days = RESURFACE_SNOOZE_BASE_DAYS * Math.pow(2, next.count - 1);
+    new Notice(
+      `Elias HiveMind: snoozed "${item.basename}" for ${days} days. It can resurface after that if it is still cold.`
+    );
+  }
+
+  /** Excludes a note from Resurface permanently. Plugin-internal state only. */
+  private applyResurfaceNever(item: ResurfaceItem): void {
+    const neverShow = [...(this.settings.resurfaceNeverShow ?? [])];
+    if (!neverShow.includes(item.path)) {
+      neverShow.push(item.path);
+      this.settings.resurfaceNeverShow = neverShow;
+      void this.saveSettings();
+    }
+    new Notice(`Elias HiveMind: "${item.basename}" will not be resurfaced again.`);
   }
 
   /** Standalone run: refreshes the backlog block in the digest note. */
@@ -3139,6 +3754,46 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
           void this.plugin.saveSettings();
         })
       );
+
+    new Setting(containerEl).setName('Resurface').setHeading();
+
+    new Setting(containerEl)
+      .setName('Cold threshold (days)')
+      .setDesc('A note untouched for at least this many days counts as gone cold and can be resurfaced.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(7, 365, 1)
+          .setValue(this.plugin.settings.resurfaceColdDays)
+          .setDynamicTooltip()
+          .onChange((value) => {
+            this.plugin.settings.resurfaceColdDays = value;
+            void this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Resurface queue size')
+      .setDesc('How many forgotten notes the Resurface forgotten notes command shows at once.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 20, 1)
+          .setValue(this.plugin.settings.resurfaceQueueSize)
+          .setDynamicTooltip()
+          .onChange((value) => {
+            this.plugin.settings.resurfaceQueueSize = value;
+            void this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Resurface section in weekly digest')
+      .setDesc('When on, each weekly digest carries a "Worth another look" list of the three highest-ranked cold notes.')
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.resurfaceInDigest).onChange((value) => {
+          this.plugin.settings.resurfaceInDigest = value;
+          void this.plugin.saveSettings();
+        })
+      );
   }
 
   /** The configuration folder is user-renameable, so the hint is built at runtime. */
@@ -3408,6 +4063,45 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
               type: 'toggle',
               key: 'backlogThemesViaBackend',
               defaultValue: DEFAULT_SETTINGS.backlogThemesViaBackend,
+            },
+          },
+        ],
+      },
+      {
+        type: 'group',
+        heading: 'Resurface',
+        items: [
+          {
+            name: 'Cold threshold (days)',
+            desc: 'A note untouched for at least this many days counts as gone cold and can be resurfaced.',
+            control: {
+              type: 'slider',
+              key: 'resurfaceColdDays',
+              min: 7,
+              max: 365,
+              step: 1,
+              defaultValue: DEFAULT_SETTINGS.resurfaceColdDays,
+            },
+          },
+          {
+            name: 'Resurface queue size',
+            desc: 'How many forgotten notes the Resurface forgotten notes command shows at once.',
+            control: {
+              type: 'slider',
+              key: 'resurfaceQueueSize',
+              min: 1,
+              max: 20,
+              step: 1,
+              defaultValue: DEFAULT_SETTINGS.resurfaceQueueSize,
+            },
+          },
+          {
+            name: 'Resurface section in weekly digest',
+            desc: 'When on, each weekly digest carries a "Worth another look" list of the three highest-ranked cold notes.',
+            control: {
+              type: 'toggle',
+              key: 'resurfaceInDigest',
+              defaultValue: DEFAULT_SETTINGS.resurfaceInDigest,
             },
           },
         ],

@@ -3,6 +3,33 @@
 All notable changes to Elias HiveMind. Versions match `manifest.json`; each
 release is cut from the tag of the same name (no `v` prefix).
 
+## 1.4.0
+
+- **New: Resurface forgotten notes.** A new command, **Resurface
+  forgotten notes**, builds a review queue of the notes that were read or
+  written and then went cold — untouched for at least the *Cold
+  threshold (days)* setting (default 90) — ranked by coldness ×
+  connectedness (backlinks, from the metadata cache) × relevance (tags
+  and vocabulary shared with the notes you edited in the last 30 days,
+  using the vault tag vocabulary). Each entry says in plain words why it
+  ranked — how long untouched, how many notes link to it, which shared
+  tag ties it to this month's work — with clauses omitted when they are
+  not true. Per note: **Open**, **Snooze** (30 days, doubling with each
+  later snooze of the same note) or **Never show**; snoozing and
+  dismissing write only the plugin's own data, never a note. The digest
+  note, the configuration folder, ignored folders and the unread backlog
+  population are excluded, so Resurface and the backlog digest never
+  double-count. Nothing is enrolled and nothing runs in the background:
+  the ranking is recomputed on each run, fully offline.
+- **Weekly digest: "Worth another look".** Each dated digest section now
+  also lists the top 3 resurfaced notes with their why-lines, gated by
+  the *Resurface section in weekly digest* setting (on by default). With
+  the setting off — or when no note has gone cold — the digest output is
+  unchanged from 1.3.0.
+- **New settings:** *Cold threshold (days)* (default 90), *Resurface
+  queue size* (default 5) and *Resurface section in weekly digest*
+  (default on), in a new Resurface settings group.
+
 ## 1.3.0
 
 - **Vault-aware local tag suggestions.** The local tagger now reads the

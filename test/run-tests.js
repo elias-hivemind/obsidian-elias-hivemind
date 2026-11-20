@@ -324,6 +324,7 @@ async function main() {
     'backlog-mark-read',
     'backlog-archive',
     'backlog-link',
+    'resurface-forgotten-notes',
     'test-backend-connection',
   ];
   expected.forEach((id) => check('registered command: ' + id, ids.includes(id), 'got: ' + ids.join(', ')));
@@ -593,8 +594,8 @@ async function main() {
   console.log('\n[10f] declarative settings definitions (Obsidian 1.13.0+)');
   const defs = tab.getSettingDefinitions();
   const groups = defs.map((d) => d.heading);
-  check('five groups, in display() order',
-    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Tags', 'Link suggestion', 'Backlog']),
+  check('six groups, in display() order',
+    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Tags', 'Link suggestion', 'Backlog', 'Resurface']),
     JSON.stringify(groups));
 
   const allItems = defs.flatMap((g) => g.items || []);
@@ -603,7 +604,8 @@ async function main() {
     'backendFormat', 'backendTimeoutMs', 'backendUrl', 'backlogArchiveFolder',
     'backlogFolders', 'backlogStaleDays', 'backlogTags', 'backlogThemesViaBackend', 'fallbackToLocal',
     'ignoreFolders', 'insertMode', 'maxLinkSuggestions', 'maxTags',
-    'minTitleLength', 'summaryHeading', 'summarySentenceCount',
+    'minTitleLength', 'resurfaceColdDays', 'resurfaceInDigest', 'resurfaceQueueSize',
+    'summaryHeading', 'summarySentenceCount',
   ];
   check('every persisted setting except backendModel has a control',
     JSON.stringify(controlKeys) === JSON.stringify(expectedKeys), JSON.stringify(controlKeys));
@@ -819,6 +821,13 @@ async function main() {
   check('backlog archive folder default is Archive', plugin.settings.backlogArchiveFolder === 'Archive');
   check('backlog themes are off by default', plugin.settings.backlogThemesViaBackend === false);
   check('backlog tags default to empty (folders only)', plugin.settings.backlogTags === '');
+
+  console.log('\n[14b] resurface settings defaults');
+  check('resurface cold threshold defaults to 90 days', plugin.settings.resurfaceColdDays === 90);
+  check('resurface queue size defaults to 5', plugin.settings.resurfaceQueueSize === 5);
+  check('resurface digest section is on by default', plugin.settings.resurfaceInDigest === true);
+  check('resurface snooze state starts empty', JSON.stringify(plugin.settings.resurfaceSnoozes) === '{}');
+  check('resurface never-show list starts empty', JSON.stringify(plugin.settings.resurfaceNeverShow) === '[]');
 
   console.log('\n[15] backlog digest: scan scope, buckets, per-item assembly');
   function makeBacklogRig(files, contents, caches, digestContent, activePath) {
@@ -1566,6 +1575,323 @@ async function main() {
   const progressText3 = progressRig.store.modified ? progressRig.store.modified.data : '';
   check('an unchanged pile says so plainly',
     progressText3.includes('No change since the last run'), progressText3.slice(0, 500));
+
+  console.log('\n[26] resurface: ranking, why-lines, threshold, exclusions');
+  function makeResurfaceRig(files, contents, caches, resolvedLinks) {
+    const rig = makeBacklogRig(files, contents, caches || {}, null);
+    rig.store.opened = [];
+    rig.app.metadataCache.resolvedLinks = resolvedLinks || {};
+    rig.app.workspace.getLeaf = () => ({
+      openFile: async (f) => { rig.store.opened.push(f.path); },
+    });
+    return rig;
+  }
+  async function runResurface(rig, data) {
+    const p = new PluginClass(rig.app, manifest);
+    if (data) p._data = data;
+    await p.onload();
+    await p.loadSettings();
+    NOTICES.length = 0;
+    MODALS.length = 0;
+    p._commands.find((c) => c.id === 'resurface-forgotten-notes').callback();
+    await flushMany();
+    return p;
+  }
+  function modalNodes(modal) { return walk(modal.contentEl); }
+  function modalTitles(modal) {
+    return modalNodes(modal).filter((n) => n.tagName === 'SPAN').map((n) => n.textContent);
+  }
+  function modalWhys(modal) {
+    return modalNodes(modal)
+      .filter((n) => n.classList && n.classList.contains('ehm-resurface-why'))
+      .map((n) => n.textContent);
+  }
+  function modalButtons(modal) {
+    return modalNodes(modal).filter((n) => n.tagName === 'BUTTON');
+  }
+  function modalAllText(modal) {
+    return modalNodes(modal).map((n) => n.textContent || '').join('\n');
+  }
+
+  const resurfaceFiles = [
+    mkStatFile('Recent Editor', nowMs - 2 * DAY, nowMs - 2 * DAY),
+    mkStatFile('Hub Note', nowMs - 200 * DAY, nowMs - 200 * DAY),
+    mkStatFile('Orphan Note', nowMs - 200 * DAY, nowMs - 200 * DAY),
+    mkStatFile('Edge 89', nowMs - 89 * DAY, nowMs - 89 * DAY),
+    mkStatFile('Edge 90', nowMs - 90 * DAY, nowMs - 90 * DAY),
+    mkStatFile('Weekly Digest', nowMs - 300 * DAY, nowMs - 300 * DAY),
+    mkStatFile('Buried', nowMs - 200 * DAY, nowMs - 200 * DAY, 'templates'),
+    mkStatFile('Cfg Note', nowMs - 200 * DAY, nowMs - 200 * DAY, '.hivecfg'),
+    mkStatFile('Unread Clip', nowMs - 200 * DAY, nowMs - 200 * DAY, 'Clippings'),
+    mkStatFile('Read Clip', nowMs - 200 * DAY, nowMs - 200 * DAY, 'Clippings'),
+    mkStatFile('Tagged Clip', nowMs - 200 * DAY, nowMs - 200 * DAY),
+  ];
+  const resurfaceContents = {
+    'Recent Editor.md': 'Compost turning notes. The compost pile needs turning and the compost heats up when turned. Garden compost feeds the beds.',
+    'Hub Note.md': '# Hub Note\n\nThe compost hub collects garden compost knowledge for every bed and season in the garden.',
+    'Orphan Note.md': '# Orphan Note\n\nXylophone mallets rest beside the metronome while tuning forks hum quietly nearby.',
+    'Edge 89.md': 'Edge eighty nine placeholder prose about nothing in particular at all.',
+    'Edge 90.md': 'Edge ninety placeholder prose about nothing in particular at all.',
+    'Weekly Digest.md': '# Weekly Digest\n\nAn old digest.',
+    'templates/Buried.md': 'A buried template note with ordinary prose inside it here.',
+    '.hivecfg/Cfg Note.md': 'A configuration folder note with ordinary prose inside it.',
+    'Clippings/Unread Clip.md': '# Unread Clip\n\nSome clipping prose that nobody has read yet at all.',
+    'Clippings/Read Clip.md': '---\nhivemind-read: true\n---\n# Read Clip\n\nTidal pools and shoreline ecology notes with plenty of ordinary prose.',
+    'Tagged Clip.md': '# Tagged Clip\n\nA tagged clipping with ordinary prose and no read marker anywhere.',
+  };
+  const resurfaceCaches = {
+    'Recent Editor.md': { frontmatter: { tags: ['compost'] } },
+    'Hub Note.md': { frontmatter: { tags: ['compost'] } },
+    'Tagged Clip.md': { frontmatter: { tags: ['to-read'] } },
+  };
+  const resurfaceLinks = {
+    'Recent Editor.md': { 'Hub Note.md': 1 },
+    'Alpha Source.md': { 'Hub Note.md': 1 },
+    'Beta Source.md': { 'Hub Note.md': 2 },
+    'Gamma Source.md': { 'Hub Note.md': 1 },
+    'Delta Source.md': { 'Hub Note.md': 1 },
+    'Epsilon Source.md': { 'Hub Note.md': 1 },
+    'Hub Note.md': { 'Hub Note.md': 3 },
+  };
+  const resurfaceRig = makeResurfaceRig(resurfaceFiles, resurfaceContents, resurfaceCaches, resurfaceLinks);
+  await runResurface(resurfaceRig, { backlogTags: 'to-read' });
+  check('resurface opens a review modal', MODALS.length === 1, 'modals: ' + MODALS.length);
+  const resurfaceModal = MODALS[MODALS.length - 1];
+  const resurfaceTitles = modalTitles(resurfaceModal);
+  const resurfaceWhys = modalWhys(resurfaceModal);
+  const resurfaceText = modalAllText(resurfaceModal);
+  check('a 200-day note with 6 backlinks outranks a 200-day orphan',
+    resurfaceTitles.indexOf('Hub Note') !== -1 &&
+    resurfaceTitles.indexOf('Orphan Note') !== -1 &&
+    resurfaceTitles.indexOf('Hub Note') < resurfaceTitles.indexOf('Orphan Note'),
+    JSON.stringify(resurfaceTitles));
+  check('why-line states age, backlinks and the shared tag, all true',
+    resurfaceWhys.length > 0 &&
+    resurfaceWhys[0].includes('untouched 6 months') &&
+    resurfaceWhys[0].includes('linked from 6 notes') &&
+    resurfaceWhys[0].includes('shares #compost with 1 note you edited this month'),
+    JSON.stringify(resurfaceWhys));
+  check('zero-value clauses are omitted (orphan why-line is age alone)',
+    resurfaceWhys[1] === 'untouched 6 months', JSON.stringify(resurfaceWhys));
+  check('threshold boundary: 90 days is in, 89 days is out',
+    resurfaceTitles.includes('Edge 90') && !resurfaceTitles.includes('Edge 89'),
+    JSON.stringify(resurfaceTitles));
+  check('digest note, ignored folder and config folder are excluded',
+    !resurfaceTitles.includes('Weekly Digest') && !resurfaceTitles.includes('Buried') &&
+    !resurfaceTitles.includes('Cfg Note'),
+    JSON.stringify(resurfaceTitles));
+  check('unread backlog population is excluded (folder and tag selection)',
+    !resurfaceTitles.includes('Unread Clip') && !resurfaceTitles.includes('Tagged Clip'),
+    JSON.stringify(resurfaceTitles));
+  check('a backlog note marked read is not backlog population and can resurface',
+    resurfaceTitles.includes('Read Clip'), JSON.stringify(resurfaceTitles));
+  check('each queued note offers Open, Snooze and Never show',
+    modalButtons(resurfaceModal).filter((b) => b.textContent === 'Open').length === 4 &&
+    modalButtons(resurfaceModal).filter((b) => b.textContent === 'Snooze').length === 4 &&
+    modalButtons(resurfaceModal).filter((b) => b.textContent === 'Never show').length === 4,
+    JSON.stringify(modalButtons(resurfaceModal).map((b) => b.textContent)));
+  check('resurface wording says untouched, never unread',
+    resurfaceText.includes('untouched') && !resurfaceText.toLowerCase().includes('unread'),
+    resurfaceText.slice(0, 300));
+
+  console.log('\n[26b] resurface: queue size setting caps the modal');
+  const manyCold = [];
+  const manyContents = {};
+  for (let i = 1; i <= 7; i += 1) {
+    manyCold.push(mkStatFile('Cold ' + i, nowMs - (100 + i * 10) * DAY, nowMs - (100 + i * 10) * DAY));
+    manyContents['Cold ' + i + '.md'] = 'Cold note number ' + i + ' with ordinary prose about storage and winter.';
+  }
+  const queueRig = makeResurfaceRig(manyCold, manyContents, {}, {});
+  await runResurface(queueRig);
+  check('default queue shows 5 of 7 cold notes',
+    modalButtons(MODALS[MODALS.length - 1]).filter((b) => b.textContent === 'Open').length === 5);
+  const queueRig2 = makeResurfaceRig(manyCold, manyContents, {}, {});
+  await runResurface(queueRig2, { resurfaceQueueSize: 2 });
+  check('queue size setting of 2 shows 2 notes',
+    modalButtons(MODALS[MODALS.length - 1]).filter((b) => b.textContent === 'Open').length === 2);
+
+  console.log('\n[26c] resurface: snooze, never-show and open act on plugin state only');
+  const abFiles = [
+    mkStatFile('Note A', nowMs - 200 * DAY, nowMs - 200 * DAY),
+    mkStatFile('Note B', nowMs - 200 * DAY, nowMs - 200 * DAY),
+  ];
+  const abContents = {
+    'Note A.md': 'Note A prose about harbour lights and ferry timetables in winter.',
+    'Note B.md': 'Note B prose about mountain trails and alpine weather in summer.',
+  };
+  const abLinks = { 'Source One.md': { 'Note A.md': 1 }, 'Source Two.md': { 'Note A.md': 1 } };
+  const abRig = makeResurfaceRig(abFiles, abContents, {}, abLinks);
+  const abPlugin = await runResurface(abRig);
+  const abModal = MODALS[MODALS.length - 1];
+  check('the backlinked note ranks first', modalTitles(abModal)[0] === 'Note A',
+    JSON.stringify(modalTitles(abModal)));
+  // Row order is A then B; each row is Open / Snooze / Never show, then Close.
+  modalButtons(abModal)[1].click();
+  await flushMany();
+  const snoozeA = abPlugin._data && abPlugin._data.resurfaceSnoozes
+    ? abPlugin._data.resurfaceSnoozes['Note A.md'] : null;
+  check('snoozing writes a plugin-internal snooze record, count 1',
+    Boolean(snoozeA) && snoozeA.count === 1, JSON.stringify(abPlugin._data));
+  check('first snooze lasts about 30 days',
+    Boolean(snoozeA) && Date.parse(snoozeA.until) - Date.now() > 29 * DAY &&
+    Date.parse(snoozeA.until) - Date.now() < 31 * DAY,
+    snoozeA && snoozeA.until);
+  check('snoozing writes no note file',
+    abRig.store.created === null && abRig.store.modified === null);
+  check('the snoozed row leaves the modal, the other stays',
+    !modalTitles(abModal).includes('Note A') && modalTitles(abModal).includes('Note B'),
+    JSON.stringify(modalTitles(abModal)));
+  modalButtons(abModal)[2].click();
+  await flushMany();
+  check('never show writes the path to the plugin-internal exclude list',
+    Boolean(abPlugin._data) && abPlugin._data.resurfaceNeverShow.includes('Note B.md'),
+    JSON.stringify(abPlugin._data));
+  check('dismissing the last row says all caught up',
+    modalAllText(abModal).includes('All caught up'), modalAllText(abModal).slice(0, 200));
+  check('never-show also writes no note file',
+    abRig.store.created === null && abRig.store.modified === null);
+
+  const abPlugin2 = await runResurface(abRig, abPlugin._data);
+  const abModal2 = MODALS[MODALS.length - 1];
+  check('snoozed and never-listed notes stay suppressed on the next run',
+    modalAllText(abModal2).includes('Nothing has gone cold yet'),
+    modalAllText(abModal2).slice(0, 200));
+  check('the suppressed run queues no notes',
+    modalButtons(abModal2).filter((b) => b.textContent === 'Open').length === 0);
+
+  abPlugin._data.resurfaceSnoozes['Note A.md'].until = new Date(Date.now() - DAY).toISOString();
+  const abPlugin3 = await runResurface(abRig, abPlugin._data);
+  const abModal3 = MODALS[MODALS.length - 1];
+  check('an expired snooze lets the note resurface (never-listed stays out)',
+    modalTitles(abModal3).includes('Note A') && !modalTitles(abModal3).includes('Note B'),
+    JSON.stringify(modalTitles(abModal3)));
+  modalButtons(abModal3)[1].click();
+  await flushMany();
+  const snoozeA2 = abPlugin3._data.resurfaceSnoozes['Note A.md'];
+  check('second snooze doubles the interval to about 60 days, count 2',
+    snoozeA2.count === 2 && Date.parse(snoozeA2.until) - Date.now() > 59 * DAY &&
+    Date.parse(snoozeA2.until) - Date.now() < 61 * DAY,
+    JSON.stringify(snoozeA2));
+
+  const cRig = makeResurfaceRig(
+    [mkStatFile('Note C', nowMs - 200 * DAY, nowMs - 200 * DAY)],
+    { 'Note C.md': 'Note C prose about desert roads and canyon weather in autumn.' }, {}, {});
+  await runResurface(cRig);
+  const cModal = MODALS[MODALS.length - 1];
+  modalButtons(cModal)[0].click();
+  await flushMany();
+  check('Open opens the note in the workspace', JSON.stringify(cRig.store.opened) === '["Note C.md"]',
+    JSON.stringify(cRig.store.opened));
+  check('Open closes the modal', walk(cModal.contentEl).length === 1);
+
+  console.log('\n[26d] resurface: preset suppression state and threshold setting');
+  const presetRig = makeResurfaceRig(abFiles, abContents, {}, abLinks);
+  await runResurface(presetRig, {
+    resurfaceSnoozes: { 'Note A.md': { until: new Date(Date.now() + 10 * DAY).toISOString(), count: 3 } },
+    resurfaceNeverShow: ['Note B.md'],
+  });
+  check('a future snooze and a never-listing suppress both notes',
+    modalAllText(MODALS[MODALS.length - 1]).includes('Nothing has gone cold yet'));
+  const thresholdRig = makeResurfaceRig(abFiles, abContents, {}, abLinks);
+  await runResurface(thresholdRig, { resurfaceColdDays: 300 });
+  check('a 300-day threshold leaves 200-day notes out',
+    modalAllText(MODALS[MODALS.length - 1]).includes('Nothing has gone cold yet'));
+
+  console.log('\n[26e] resurface: honest empty states');
+  const resurfaceEmptyRig = makeResurfaceRig([], {}, {}, {});
+  await runResurface(resurfaceEmptyRig);
+  const resurfaceEmptyText = modalAllText(MODALS[MODALS.length - 1]);
+  check('empty vault says plainly that nothing has gone cold yet',
+    resurfaceEmptyText.includes('Nothing has gone cold yet'), resurfaceEmptyText.slice(0, 200));
+  check('empty vault queues no filler entries',
+    modalButtons(MODALS[MODALS.length - 1]).filter((b) => b.textContent === 'Open').length === 0);
+  const resurfaceRecentRig = makeResurfaceRig(
+    [mkStatFile('Fresh One', nowMs - DAY, nowMs - DAY), mkStatFile('Fresh Two', nowMs - 2 * DAY, nowMs - 2 * DAY)],
+    { 'Fresh One.md': 'Fresh prose one.', 'Fresh Two.md': 'Fresh prose two.' }, {}, {});
+  await runResurface(resurfaceRecentRig);
+  const resurfaceRecentText = modalAllText(MODALS[MODALS.length - 1]);
+  check('all-recent vault says plainly that nothing has gone cold yet',
+    resurfaceRecentText.includes('Nothing has gone cold yet') && resurfaceRecentText.includes('untouched'),
+    resurfaceRecentText.slice(0, 200));
+
+  console.log('\n[26f] resurface in the weekly digest: section, cap, byte-identical gate');
+  async function runWeeklyResurface(rig, data) {
+    const p = new PluginClass(rig.digestApp, manifest);
+    if (data) p._data = data;
+    await p.onload();
+    await p.loadSettings();
+    NOTICES.length = 0;
+    MODALS.length = 0;
+    p._commands.find((c) => c.id === 'weekly-digest-local').callback();
+    await flushMany();
+    return rig.store.created ? rig.store.created.data : (rig.store.modified || '');
+  }
+  const weekOnlyFiles = [mkStatFile('Fresh Week Note', nowMs - DAY, nowMs - DAY)];
+  const weekOnlyContents = {
+    'Fresh Week Note.md': '# Fresh Week Note\n\nHarbour lights guide the ferry across the winter water every evening.',
+  };
+  const gateRigOn = makeDigestRig(weekOnlyFiles, weekOnlyContents, null);
+  const gateTextOn = await runWeeklyResurface(gateRigOn, null);
+  const gateRigOff = makeDigestRig(weekOnlyFiles, weekOnlyContents, null);
+  const gateTextOff = await runWeeklyResurface(gateRigOff, { resurfaceInDigest: false });
+  check('digest with no cold notes is byte-identical with the resurface toggle on or off',
+    gateTextOn === gateTextOff && gateTextOn.length > 0,
+    'on: ' + gateTextOn.length + ' bytes, off: ' + gateTextOff.length + ' bytes');
+  check('no resurface section appears when nothing has gone cold',
+    !gateTextOn.includes('Worth another look'));
+
+  const digestColdFiles = [
+    mkStatFile('Fresh Week Note', nowMs - DAY, nowMs - DAY),
+    mkStatFile('Hub Note', nowMs - 200 * DAY, nowMs - 200 * DAY),
+    mkStatFile('Cold Two', nowMs - 200 * DAY, nowMs - 200 * DAY),
+    mkStatFile('Cold Three', nowMs - 200 * DAY, nowMs - 200 * DAY),
+    mkStatFile('Cold Four', nowMs - 200 * DAY, nowMs - 200 * DAY),
+  ];
+  const digestColdContents = {
+    'Fresh Week Note.md': weekOnlyContents['Fresh Week Note.md'],
+    'Hub Note.md': 'The hub note prose about harbour lights and ferry routes in winter.',
+    'Cold Two.md': 'Cold two prose about mountain trails and alpine weather in summer.',
+    'Cold Three.md': 'Cold three prose about desert roads and canyon weather in autumn.',
+    'Cold Four.md': 'Cold four prose about forest paths and river weather in spring.',
+  };
+  const digestRig = makeDigestRig(digestColdFiles, digestColdContents, null);
+  digestRig.digestApp.metadataCache.resolvedLinks = {
+    'S1.md': { 'Hub Note.md': 1 }, 'S2.md': { 'Hub Note.md': 1 }, 'S3.md': { 'Hub Note.md': 1 },
+  };
+  const resurfaceDigestText = await runWeeklyResurface(digestRig, null);
+  check('weekly digest gains a Worth another look section when notes are cold',
+    resurfaceDigestText.includes('### Worth another look'), resurfaceDigestText.slice(0, 600));
+  check('the section follows the backlog section inside the dated digest',
+    resurfaceDigestText.indexOf('### Worth another look') > resurfaceDigestText.indexOf('### Your backlog'));
+  check('the section lists the top note with its why-line',
+    resurfaceDigestText.includes('- [[Hub Note]] — untouched 6 months · linked from 3 notes'),
+    resurfaceDigestText.slice(resurfaceDigestText.indexOf('### Worth another look')));
+  const resurfaceSection = resurfaceDigestText.slice(resurfaceDigestText.indexOf('### Worth another look'));
+  check('the digest section is capped at 3 notes',
+    (resurfaceSection.match(/- \[\[/g) || []).length === 3,
+    resurfaceSection.slice(0, 400));
+  const digestOffRig = makeDigestRig(digestColdFiles, digestColdContents, null);
+  const digestOffText = await runWeeklyResurface(digestOffRig, { resurfaceInDigest: false });
+  check('the toggle off keeps cold notes out of the digest entirely',
+    !digestOffText.includes('Worth another look') && digestOffText.includes('### Your backlog'));
+
+  console.log('\n[26g] resurface offline path: zero network requests');
+  let resurfaceRequestCount = 0;
+  REQUEST_HANDLER = () => { resurfaceRequestCount += 1; throw new Error('network disabled in test'); };
+  const offlineResurfaceRig = makeResurfaceRig(abFiles, abContents, {}, abLinks);
+  await runResurface(offlineResurfaceRig);
+  check('resurface command completes with the network handler armed to fail',
+    modalTitles(MODALS[MODALS.length - 1]).includes('Note A'));
+  const offlineDigestRig = makeDigestRig(digestColdFiles, digestColdContents, null);
+  offlineDigestRig.digestApp.metadataCache.resolvedLinks = {
+    'S1.md': { 'Hub Note.md': 1 }, 'S2.md': { 'Hub Note.md': 1 }, 'S3.md': { 'Hub Note.md': 1 },
+  };
+  const offlineDigestText = await runWeeklyResurface(offlineDigestRig, null);
+  check('weekly digest with its resurface section completes offline too',
+    offlineDigestText.includes('### Worth another look'));
+  check('zero network requests were made by either resurface path',
+    resurfaceRequestCount === 0, 'requests: ' + resurfaceRequestCount);
+  REQUEST_HANDLER = null;
 
   console.log('\n' + '='.repeat(56));
   console.log('  PASSED: ' + passed + '   FAILED: ' + failed);
