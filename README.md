@@ -442,3 +442,15 @@ The above copyright notice and this permission notice shall be included in all c
 THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 See [LICENSE](LICENSE) for the full text.
+
+## Part of the Nova Ops shelf
+
+Elias HiveMind is one tool on the [Nova Ops](https://github.com/elias-hivemind)
+shelf — local-first tools, verified working before they are trusted:
+
+- **[release-gate](https://github.com/elias-hivemind/release-gate)** —
+  a fail-closed release verifier: `seal` writes SHA256SUMS plus a
+  hash-chained ledger; `verify` refuses on tamper, missing files, or
+  stale seals.
+- **[nova-ops-nim-mcp](https://github.com/elias-hivemind/nova-ops-nim-mcp)** —
+  an MCP server for NIM video generation, built for MCP clients.
