@@ -4,6 +4,12 @@ Summaries, tag suggestions and link suggestions for Obsidian, working offline by
 
 New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language steps from install to your first Backlog Digest.
 
+## Try it in five minutes — free template vault
+
+**HiveMind OS** is a free 30-note demo vault (a fictional researcher's notes, fully seeded) built to show what the plugin does: unzip it, run the included `set-ages.sh`, open the folder as a vault, and run the Weekly Digest, Backlog Digest, and Resurface commands on notes that are already aged, linked, and waiting.
+
+Download: [HiveMind-OS-Vault-v1.zip](https://github.com/elias-hivemind/obsidian-elias-hivemind/releases/download/1.5.0/HiveMind-OS-Vault-v1.zip) (attached to the 1.5.0 release)
+
 - **Plugin id:** `elias-hivemind`
 - **Version:** 1.5.0
 - **Minimum Obsidian version:** 1.0.0
