@@ -26,8 +26,11 @@
  *       tag merges only.
  *
  *   Link suggestion
- *     - scans the vault for notes whose title or alias appears verbatim in the
- *       current note but is not yet linked, and offers to insert wikilinks.
+ *     - scans the vault for notes whose title or alias is mentioned in the
+ *       current note but not yet linked, and offers to wrap those mentions
+ *       in wikilinks in place. Matching is case-insensitive, handles simple
+ *       plurals, and tolerates hyphen/space and minor punctuation variation
+ *       in multi-word titles - all deterministic local text processing.
  *
  *   Weekly digest
  *     - local only: collects the notes created or modified in the last seven
@@ -844,6 +847,15 @@ interface LinkSuggestion {
   basename: string;
   occurrences: number;
   viaAlias: boolean;
+  /** Short snippet around the first mention, for the review modal. */
+  context?: string;
+}
+
+/** One concrete mention of a title in a text: character offsets and the exact surface text. */
+interface MentionSpan {
+  start: number;
+  end: number;
+  text: string;
 }
 
 function isWordChar(ch: string): boolean {
@@ -870,6 +882,214 @@ function countWholeWordOccurrences(haystackLower: string, needleLower: string): 
   }
 
   return count;
+}
+
+/**
+ * The title forms a mention may take, lowercased and deduplicated:
+ * the title itself, the title with apostrophes/periods dropped
+ * ("Maker's Mark" -> "makers mark", "St. John" -> "st john"), and simple
+ * plural variants of the LAST word only - title + trailing s/es, and the
+ * reverse (a plural title also matches its singular). Deliberately NOT
+ * included: substring/prefix matching, stemming beyond s/es (and the
+ * consonant-y -> ies pair), edit-distance fuzz, or single-word partial
+ * titles - each of those can fire on words the user never meant as a
+ * mention, and a false link is worse than a missed one.
+ */
+function linkTitleVariants(title: string): string[] {
+  const base = title.trim().toLowerCase();
+  const variants = new Set<string>();
+  const add = (v: string): void => {
+    const t = v.trim().replace(/\s+/g, ' ');
+    if (t) variants.add(t);
+  };
+  add(base);
+  add(base.replace(/'/g, ''));
+  add(base.replace(/\./g, ''));
+  add(base.replace(/[.']/g, ''));
+
+  const words = base.split(' ');
+  const last = words[words.length - 1];
+  const withLast = (w: string): string => [...words.slice(0, -1), w].join(' ');
+  if (last.length > 1) {
+    if (last.endsWith('ies') && last.length > 3) {
+      add(withLast(last.slice(0, -3) + 'y'));
+    } else if (/(?:ses|xes|zes|ches|shes)$/.test(last)) {
+      add(withLast(last.slice(0, -2)));
+      add(withLast(last.slice(0, -1)));
+    } else if (last.endsWith('es')) {
+      add(withLast(last.slice(0, -2)));
+      add(withLast(last.slice(0, -1)));
+    } else if (last.endsWith('s') && !last.endsWith('ss')) {
+      add(withLast(last.slice(0, -1)));
+    }
+    if (!last.endsWith('s')) {
+      add(withLast(last + 's'));
+      if (/(?:x|z|ch|sh)$/.test(last)) add(withLast(last + 'es'));
+      if (/[^aeiou]y$/.test(last)) add(withLast(last.slice(0, -1) + 'ies'));
+    }
+  }
+  // Apostrophe-dropped forms of every variant, so "Makers Marks" (plural,
+  // no apostrophe) still matches the title "Maker's Mark".
+  for (const v of Array.from(variants)) add(v.replace(/[.']/g, ''));
+  return Array.from(variants);
+}
+
+/**
+ * Tries to match `needleLower` at `start` in `haystackLower`, returning the
+ * end offset or -1. A space or hyphen in the needle matches a run of
+ * spaces, hyphens, tabs and commas in the text, so "Alpha Harvest" also
+ * matches "alpha-harvest" and "Alpha, Harvest" - the full title must still
+ * be present, word for word; only the separators may vary.
+ */
+function matchNeedleAt(haystackLower: string, start: number, needleLower: string): number {
+  let h = start;
+  let n = 0;
+  while (n < needleLower.length) {
+    const nc = needleLower.charAt(n);
+    if (nc === ' ' || nc === '-') {
+      let sawSeparator = false;
+      while (h < haystackLower.length) {
+        const hc = haystackLower.charAt(h);
+        if (hc === ' ' || hc === '-' || hc === '\t') {
+          sawSeparator = true;
+          h += 1;
+        } else if (hc === ',') {
+          h += 1;
+        } else {
+          break;
+        }
+      }
+      if (!sawSeparator) return -1;
+      n += 1;
+      while (n < needleLower.length && (needleLower.charAt(n) === ' ' || needleLower.charAt(n) === '-')) {
+        n += 1;
+      }
+      continue;
+    }
+    if (h >= haystackLower.length || haystackLower.charAt(h) !== nc) return -1;
+    h += 1;
+    n += 1;
+  }
+  return h;
+}
+
+/** Character ranges of a note that must never yield or receive a link. */
+function protectedLinkRanges(markdown: string): Array<{ start: number; end: number }> {
+  const ranges: Array<{ start: number; end: number }> = [];
+  const block = frontmatterBlock(markdown);
+  if (block) ranges.push({ start: 0, end: block.text.length });
+  const patterns = [
+    /```[\s\S]*?```/g, // fenced code
+    /~~~[\s\S]*?~~~/g, // alternate fences
+    /`[^`\n]*`/g, // inline code
+    /!?\[\[[^\]]*\]\]/g, // existing wikilinks and embeds
+    /\[[^\]]*\]\([^)]*\)/g, // existing markdown links
+    /https?:\/\/\S+/g, // bare urls
+    /<[^>]+>/g, // html
+  ];
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(markdown)) !== null) {
+      ranges.push({ start: match.index, end: match.index + match[0].length });
+      if (match[0].length === 0) pattern.lastIndex += 1;
+    }
+  }
+  return ranges;
+}
+
+function overlapsProtected(
+  ranges: Array<{ start: number; end: number }>,
+  start: number,
+  end: number
+): boolean {
+  return ranges.some((r) => start < r.end && end > r.start);
+}
+
+/**
+ * Every mention of `title` in `text`, as spans in the ORIGINAL text.
+ * Whole-word boundaries are required on both sides; when protected ranges
+ * are supplied, any span touching one is dropped. When several variants
+ * match at one position the longest surface wins, and spans never overlap.
+ */
+function findMentionSpans(
+  text: string,
+  title: string,
+  ranges?: Array<{ start: number; end: number }>
+): MentionSpan[] {
+  const haystackLower = text.toLowerCase();
+  const variants = linkTitleVariants(title);
+  const spans: MentionSpan[] = [];
+
+  for (let pos = 0; pos < haystackLower.length; pos += 1) {
+    const ch = haystackLower.charAt(pos);
+    let bestEnd = -1;
+    for (const needle of variants) {
+      if (needle.charAt(0) !== ch) continue;
+      const end = matchNeedleAt(haystackLower, pos, needle);
+      if (end > bestEnd) bestEnd = end;
+    }
+    if (bestEnd === -1) continue;
+
+    const before = pos === 0 ? '' : haystackLower.charAt(pos - 1);
+    const after = bestEnd >= haystackLower.length ? '' : haystackLower.charAt(bestEnd);
+    if (isWordChar(before) || isWordChar(after)) continue;
+    if (ranges && overlapsProtected(ranges, pos, bestEnd)) continue;
+
+    spans.push({ start: pos, end: bestEnd, text: text.slice(pos, bestEnd) });
+    pos = bestEnd - 1;
+  }
+  return spans;
+}
+
+/** The wikilink that wraps one concrete mention, preserving its surface text when it differs from the canonical form. */
+function inlineLinkFor(suggestion: LinkSuggestion, matchedText: string): string {
+  if (suggestion.viaAlias) {
+    return matchedText.toLowerCase() === suggestion.title.toLowerCase()
+      ? `[[${suggestion.basename}|${suggestion.title}]]`
+      : `[[${suggestion.basename}|${matchedText}]]`;
+  }
+  return matchedText.toLowerCase() === suggestion.basename.toLowerCase()
+    ? `[[${suggestion.basename}]]`
+    : `[[${suggestion.basename}|${matchedText}]]`;
+}
+
+/**
+ * Wraps every mention of the chosen suggestions in `[[...]]`, in place.
+ * Pure and deterministic: the same note and the same choices always give
+ * the same result. Mentions inside frontmatter, code, existing links and
+ * URLs are never wrapped (they sit in protected ranges), so re-running it
+ * on its own output wraps nothing twice. Overlapping mentions of different
+ * notes resolve to the earliest, then the longest, span.
+ */
+function applyInlineLinks(
+  markdown: string,
+  chosen: LinkSuggestion[]
+): { text: string; wrapped: number } {
+  const ranges = protectedLinkRanges(markdown);
+  const jobs: Array<{ span: MentionSpan; suggestion: LinkSuggestion }> = [];
+  for (const suggestion of chosen) {
+    for (const span of findMentionSpans(markdown, suggestion.title, ranges)) {
+      jobs.push({ span, suggestion });
+    }
+  }
+  jobs.sort(
+    (a, b) =>
+      a.span.start - b.span.start ||
+      b.span.end - b.span.start - (a.span.end - a.span.start)
+  );
+
+  let out = '';
+  let cursor = 0;
+  let wrapped = 0;
+  for (const job of jobs) {
+    if (job.span.start < cursor) continue;
+    out += markdown.slice(cursor, job.span.start);
+    out += inlineLinkFor(job.suggestion, job.span.text);
+    cursor = job.span.end;
+    wrapped += 1;
+  }
+  out += markdown.slice(cursor);
+  return { text: out, wrapped };
 }
 
 function parseIgnoreFolders(raw: string): string[] {
@@ -933,16 +1153,23 @@ function findLinkSuggestions(
       if (alreadyLinked.has(title.toLowerCase())) continue;
       if (alreadyLinked.has(file.basename.toLowerCase())) continue;
 
-      const occurrences = countWholeWordOccurrences(haystack, title.toLowerCase());
+      const spans = findMentionSpans(haystack, title);
+      const occurrences = spans.length;
       if (occurrences === 0) continue;
 
       if (!best || occurrences > best.occurrences || title.length > best.title.length) {
+        const first = spans[0];
+        const context = haystack
+          .slice(Math.max(0, first.start - 30), Math.min(haystack.length, first.end + 30))
+          .replace(/\s+/g, ' ')
+          .trim();
         best = {
           title,
           path: file.path,
           basename: file.basename,
           occurrences,
           viaAlias: candidate.viaAlias,
+          context,
         };
       }
     }
@@ -2576,23 +2803,24 @@ export default class EliasHiveMindPlugin extends Plugin {
       title: 'Suggested links',
       intro: `${suggestions.length} note${
         suggestions.length === 1 ? '' : 's'
-      } mentioned in this note but not yet linked.`,
+      } mentioned in this note but not yet linked. Applying wraps each mention in a wikilink where it stands.`,
       confirmText: 'Insert selected',
       items: suggestions,
       label: (s) => s.title,
-      meta: (s) => `${s.occurrences}x${s.viaAlias ? ' (alias)' : ''}`,
+      meta: (s) =>
+        `${s.occurrences}x${s.viaAlias ? ' (alias)' : ''}${s.context ? ` · \u2026${s.context}\u2026` : ''}`,
       onSubmit: (chosen) => {
         if (chosen.length === 0) return;
 
-        const lines = chosen.map((s) => `- ${wikilinkFor(s)}`).join('\n');
-        const block = `\n\n## Suggested links\n${lines}\n`;
-
-        const lastLine = editor.lastLine();
-        const lastCh = editor.getLine(lastLine).length;
-        editor.replaceRange(block, { line: lastLine, ch: lastCh });
+        const { text, wrapped } = applyInlineLinks(editor.getValue(), chosen);
+        if (wrapped === 0) {
+          new Notice('Elias HiveMind: no mentions could be linked in place.');
+          return;
+        }
+        editor.setValue(text);
 
         new Notice(
-          `Elias HiveMind: inserted ${chosen.length} link${chosen.length === 1 ? '' : 's'}.`
+          `Elias HiveMind: linked ${wrapped} mention${wrapped === 1 ? '' : 's'} in place.`
         );
       },
     }).open();
@@ -3342,8 +3570,9 @@ export default class EliasHiveMindPlugin extends Plugin {
 
   /**
    * The digest's "link" action: the same unlinked-mention suggestions as
-   * the editor command, appended to the open clipping under a
-   * "## Suggested links" heading once the user confirms the checklist.
+   * the editor command, applied the same way - once the user confirms the
+   * checklist, each chosen mention in the open clipping is wrapped in a
+   * wikilink in place via the shared applyInlineLinks helper.
    */
   private async runBacklogLink(): Promise<void> {
     const file = this.backlogActiveFile();
@@ -3360,20 +3589,24 @@ export default class EliasHiveMindPlugin extends Plugin {
       title: 'Suggested links',
       intro: `${suggestions.length} note${
         suggestions.length === 1 ? '' : 's'
-      } mentioned in this clipping but not yet linked.`,
+      } mentioned in this clipping but not yet linked. Applying wraps each mention in a wikilink where it stands.`,
       confirmText: 'Insert selected',
       items: suggestions,
       label: (s) => s.title,
-      meta: (s) => `${s.occurrences}x${s.viaAlias ? ' (alias)' : ''}`,
+      meta: (s) =>
+        `${s.occurrences}x${s.viaAlias ? ' (alias)' : ''}${s.context ? ` \u00b7 \u2026${s.context}\u2026` : ''}`,
       onSubmit: (chosen) => {
         if (chosen.length === 0) return;
-        const lines = chosen.map((s) => `- ${wikilinkFor(s)}`).join('\n');
-        const block = `\n\n## Suggested links\n${lines}\n`;
         void (async () => {
           const current = await this.app.vault.read(file);
-          await this.app.vault.modify(file, current + block);
+          const { text, wrapped } = applyInlineLinks(current, chosen);
+          if (wrapped === 0) {
+            new Notice('Elias HiveMind: no mentions could be linked in place.');
+            return;
+          }
+          await this.app.vault.modify(file, text);
           new Notice(
-            `Elias HiveMind: inserted ${chosen.length} link${chosen.length === 1 ? '' : 's'}.`
+            `Elias HiveMind: linked ${wrapped} mention${wrapped === 1 ? '' : 's'} in place.`
           );
         })();
       },

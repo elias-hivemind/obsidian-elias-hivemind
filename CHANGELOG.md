@@ -3,6 +3,35 @@
 All notable changes to Elias HiveMind. Versions match `manifest.json`; each
 release is cut from the tag of the same name (no `v` prefix).
 
+## 1.5.0
+
+- **Link suggestions now link in place.** **Suggest links for current
+  note** used to append a `- [[link]]` list under a `## Suggested links`
+  heading at the bottom of the note, leaving you to wire up the actual
+  mentions by hand. Applying a suggestion now wraps every mention of the
+  chosen note in a wikilink where it stands — alias mentions as
+  `[[Note name|alias]]` — and appends nothing. The review checklist is
+  unchanged in shape (you still approve per note before any write) and
+  now shows a snippet of the first mention in context beside each count.
+  A mention whose surface differs from the note's title keeps its own
+  words as the link's display text (`[[Compost Pile|compost piles]]`), so
+  the sentence reads exactly as written. Mentions inside frontmatter,
+  code blocks and inline code, existing links and URLs are never
+  wrapped, and re-running the command on its own output wraps nothing
+  twice. The **Backlog: link current note** command applies links the
+  same way, through the same helper.
+- **Wider, still conservative matching.** Link matching stays
+  case-insensitive and whole-word, and now also recognises simple
+  plurals — a title and its plural mention find each other either way
+  round (trailing `s`/`es`, plus consonant-`y` → `ies`) — and a full
+  multi-word title written with different separators (`Alpha Harvest`
+  also matches `alpha-harvest` or `Alpha, Harvest`) or without its
+  apostrophes/periods. Deliberately not added: substring or prefix
+  matching, partial titles, stemming beyond plurals, or edit-distance
+  fuzz — each can fire on words never meant as a mention, and a false
+  link is worse than a missed one. All matching is deterministic local
+  text processing: no embeddings, no backend, no network.
+
 ## 1.4.0
 
 - **New: Resurface forgotten notes.** A new command, **Resurface

@@ -5,7 +5,7 @@ Summaries, tag suggestions and link suggestions for Obsidian, working offline by
 New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language steps from install to your first Backlog Digest.
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.4.0
+- **Version:** 1.5.0
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -63,7 +63,7 @@ Tagging a messy vault one note at a time does not scale, so the **Housekeeping s
 
 ### Internal link suggestions
 
-Finds other notes whose **title or alias** appears in the current note as a whole word (case-insensitive) but isn't linked yet, and lets you choose which ones to link. It skips:
+Finds other notes whose **title or alias** is mentioned in the current note but isn't linked yet, and lets you choose which ones to link. The review list shows each suggestion with its mention count and a snippet of the first mention in context. It skips:
 
 - the current note itself
 - notes already linked from the current note
@@ -71,7 +71,9 @@ Finds other notes whose **title or alias** appears in the current note as a whol
 - titles shorter than the minimum title length
 - notes in ignored folders
 
-The chosen links are appended to the end of the note under a `## Suggested links` heading. Mentions found through an alias are inserted as `[[Note name|alias]]`.
+Matching is case-insensitive and whole-word, and in 1.5.0 it also recognises simple plurals (a title and its plural mention find each other either way round) and a full multi-word title written with different separators (`Alpha Harvest` also matches `alpha-harvest` or `Alpha, Harvest`) or without its apostrophes/periods. Nothing fuzzier than that is matched — no substrings, no partial titles, no near-miss words — so a suggestion is never a guess.
+
+Applying **wraps each mention in a wikilink where it stands** — nothing is appended to the note. Mentions found through an alias are wrapped as `[[Note name|alias]]`; a mention whose surface differs from the note's title (a plural, a hyphenated form) keeps its own words as the link's display text, so your sentence still reads exactly as you wrote it. Mentions inside frontmatter, code, existing links and URLs are never wrapped, and re-running the command on its own output wraps nothing twice. The **Backlog: link** command applies links the same way.
 
 ### Weekly digest
 
@@ -99,7 +101,7 @@ Saved articles pile up in a clippings folder and are never read. The backlog dig
   - **Junk candidates** — near-empty (under 25 words of readable text) or a near-duplicate of another clipping, judged by overlap of their significant words.
 - One run digests at most 50 unread clippings, most recently saved first, so a 500-clipping pile stays fast — including on a phone. The rest are counted in the section and picked up by the next run. Clippings in the archive folder, the configuration folder and ignored folders are excluded, and clippings you have marked read are skipped (the scan checks the metadata cache first, so a large already-read pile costs no file reads).
 - From the second run on, the section opens with a one-line progress report — how many clippings left the pile since the last run, or that it grew, or that nothing changed — measured against the previous run's count, which the plugin remembers between runs.
-- Processing is one explicit command per clipping, run while the clipping is open: **apply suggested tags** (the usual checklist, written to frontmatter), **link** (the usual unlinked-mention checklist, appended under a `## Suggested links` heading), **mark as read** (writes a `hivemind-read: true` frontmatter property; marked clippings drop out of later digests), or **archive** (moves the clipping into the archive folder, default `Archive`, creating it if needed and refusing rather than overwriting a same-named note). The digest itself only links to each clipping — opening the link is the tap. **The plugin never deletes anything, and never moves or marks a note on its own.**
+- Processing is one explicit command per clipping, run while the clipping is open: **apply suggested tags** (the usual checklist, written to frontmatter), **link** (the usual unlinked-mention checklist, applied in place — each mention you pick is wrapped in a wikilink where it stands), **mark as read** (writes a `hivemind-read: true` frontmatter property; marked clippings drop out of later digests), or **archive** (moves the clipping into the archive folder, default `Archive`, creating it if needed and refusing rather than overwriting a same-named note). The digest itself only links to each clipping — opening the link is the tap. **The plugin never deletes anything, and never moves or marks a note on its own.**
 - Optionally, with *Backlog themes via backend* switched on, a digest run also asks your configured backend to group the clippings into cross-article themes. It is off by default and best-effort: if the backend is unreachable the local digest is written without themes.
 
 ### Resurface forgotten notes
@@ -119,7 +121,7 @@ The weekly digest covers what was new this week, and the backlog digest covers c
 - **Local commands** (every command marked *local*, and *Suggest links for current note*) make no network requests.
 - **Suggest links for current note** reads the file list of the whole vault (the names, paths and aliases of your notes) to find mentions of them in the current note. It does this only when you run the command, and nothing it reads is stored or sent anywhere.
 - **Weekly digest (local)** reads the notes created or modified in the last seven days (their content, to summarize them), only when you run the command. The only thing it writes is the digest note, inside your vault.
-- **Backlog digest** reads the clippings in your backlog folders or carrying a backlog tag (their content, to summarize and classify them) and the notes you touched in the last seven days (to judge relevance), only when you run a digest command. Tag-based selection reads only the metadata cache's tag list, never file content. It writes only the digest note. The four **Backlog:** processing commands write or move only the one note you run them on — a tag merge, appended links, a `hivemind-read: true` frontmatter marker, or a move into your archive folder — and only when you run them.
+- **Backlog digest** reads the clippings in your backlog folders or carrying a backlog tag (their content, to summarize and classify them) and the notes you touched in the last seven days (to judge relevance), only when you run a digest command. Tag-based selection reads only the metadata cache's tag list, never file content. It writes only the digest note. The four **Backlog:** processing commands write or move only the one note you run them on — a tag merge, mentions wrapped in wikilinks in place, a `hivemind-read: true` frontmatter marker, or a move into your archive folder — and only when you run them.
 - **Housekeeping sweep** reads the notes in the scope you pick (their content, to compute tag suggestions) only when you run the command and choose that scope, and writes only the frontmatter tag merges you approve in its review — nothing is written by the scan itself. Vault-aware tag suggestions additionally read the metadata cache's tag list for the whole vault, never note content.
 - **Resurface forgotten notes** reads note modification times, the metadata cache's link map and tag list, and — only when you run the command or a digest — the content of cold notes and of notes touched in the last 30 days, to judge relevance. It makes no network requests. Snoozing or dismissing a note writes only the plugin's own data file; no note is changed.
 - **Backlog themes**, only if you switch *Backlog themes via backend* on, sends the clippings' titles and summaries (not their full text) to the **Backend URL** you configure — the same local server as the other backend commands. With the setting off, no backlog request is ever made.
@@ -286,13 +288,13 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 | Summarize selection (local) | None | Summarizes the selected text and inserts the heading and summary directly after the selection. Ignores the insert-position setting. |
 | Suggest tags for current note (local) | None | Suggests tags from the note's most frequent words, preferring tags your vault already uses; you pick which to add to frontmatter. |
 | Suggest tags for current note (backend) | Backend URL | Asks the model for tags; you pick which to add to frontmatter. Falls back to local if enabled. |
-| Suggest links for current note | None | Lists notes mentioned but not linked; you pick which links to append. |
+| Suggest links for current note | None | Lists notes mentioned but not linked, each with a context snippet; you pick which mentions to wrap in wikilinks in place. |
 | Housekeeping sweep: suggest tags for a folder or the vault | None | Dry-runs the local tagger over a folder (subfolders included) or the whole vault, at most 50 notes per run; you review every proposed change and approve per note before anything is written. Writes frontmatter tag merges only. |
 | Weekly digest (local) | None | Summarizes the notes created or modified in the last seven days into `Weekly Digest.md`. |
 | Backlog digest | None¹ | Digests the unread clippings in your backlog folders (or carrying a backlog tag) into the "Your backlog" section of `Weekly Digest.md`: summary, tags, read time, age, bucketed by relevance. |
 | Resurface forgotten notes | None | Opens a review of the notes that have gone cold — untouched past the cold threshold, ranked by backlinks and overlap with your last 30 days of notes — to open, snooze or dismiss. The weekly digest carries the top 3 as "Worth another look". |
 | Backlog: apply suggested tags to current note | None | Suggests tags for the open clipping and merges the ones you pick into its frontmatter. Only on a backlog clipping. |
-| Backlog: link current note to the notes it mentions | None | Appends the unlinked mentions you pick to the open clipping under a `## Suggested links` heading. Only on a backlog clipping. |
+| Backlog: link current note to the notes it mentions | None | Wraps the unlinked mentions you pick in wikilinks in place in the open clipping. Only on a backlog clipping. |
 | Backlog: mark current note as read | None | Writes `hivemind-read: true` into the open clipping's frontmatter, so it drops out of later digests. Only on a backlog clipping. |
 | Backlog: archive current note | None | Moves the open clipping into your archive folder. Refuses rather than overwriting a same-named note. Only on a backlog clipping. |
 | Test backend connection | Backend URL | Sends a test sentence and shows the reply or the error. |

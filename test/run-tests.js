@@ -467,19 +467,26 @@ async function main() {
   confirm.click();
 
   const inserted = linkEd.text;
-  check('suggested-links block appended', inserted.includes('## Suggested links'));
-  check('suggests Bionic Workflow', inserted.includes('[[Bionic Workflow]]'));
-  check('suggests Crown Operations', inserted.includes('[[Crown Operations'));
-  check('does NOT re-suggest already-linked note',
-    !inserted.split('## Suggested links')[1].includes('[[Forge Memory Vault]]'));
+  // v1.5.0 behaviour change (documented): applying no longer appends a
+  // "## Suggested links" list - it wraps the mentions in place.
+  check('no suggested-links block appended (v1.5.0 in-place behaviour)',
+    !inserted.includes('## Suggested links'));
+  check('Bionic Workflow mention wrapped in place',
+    inserted.includes('worked on the [[Bionic Workflow]] and reviewed'));
+  check('Crown Operations mention wrapped in place',
+    inserted.includes('reviewed [[Crown Operations]].'));
+  check('already-linked note not wrapped a second time',
+    (inserted.match(/\[\[Forge Memory Vault\]\]/g) || []).length === 1, inserted);
+  check('mention inside inline code NOT wrapped',
+    inserted.includes('`Crown Operations` inside code'), inserted);
   check('does NOT suggest title shorter than minTitleLength',
-    !inserted.split('## Suggested links')[1].includes('[[Zed]]'));
+    !inserted.includes('[[Zed]]'));
   check('does NOT suggest the active note itself',
-    !inserted.split('## Suggested links')[1].includes('[[Daily Note]]'));
+    !inserted.includes('[[Daily Note]]'));
   check('ignored folder excluded',
-    !inserted.split('## Suggested links')[1].includes('[[Template Scratch]]'));
+    !inserted.includes('[[Template Scratch]]'));
   check('vault configDir excluded even when not listed in ignoreFolders',
-    !inserted.split('## Suggested links')[1].includes('[[Config Leak]]'));
+    !inserted.includes('[[Config Leak]]'));
 
   console.log('\n[10] no unlinked mentions -> clean notice');
   const cleanEd = new MockEditor('Nothing here refers to any other note at all.');
@@ -1219,10 +1226,14 @@ async function main() {
   check('link opens the suggestion checklist for the clipping', MODALS.length === 1, 'modals: ' + MODALS.length);
   confirmLatestModal('Insert selected');
   await flushMany();
-  check('link appends the chosen notes under a Suggested links heading',
+  // v1.5.0 behaviour change (documented): the backlog link command shares
+  // the editor command's in-place apply - mentions are wrapped where they
+  // stand and no "## Suggested links" list is appended.
+  check('link wraps the chosen mentions in place (v1.5.0, no appended list)',
     linkRig.store.modified !== null &&
-    linkRig.store.modified.data.includes('## Suggested links') &&
-    linkRig.store.modified.data.includes('- [[Project Atlas]]'),
+    !linkRig.store.modified.data.includes('## Suggested links') &&
+    (linkRig.store.modified.data.match(/\[\[Project Atlas\]\]/g) || []).length === 2 &&
+    linkRig.store.modified.data.includes('[[Project Atlas]] guides the planting'),
     linkRig.store.modified ? linkRig.store.modified.data.slice(-200) : 'no modify');
 
   console.log('\n[19] backlog themes: opt-in backend pass, best-effort');
@@ -1892,6 +1903,124 @@ async function main() {
   check('zero network requests were made by either resurface path',
     resurfaceRequestCount === 0, 'requests: ' + resurfaceRequestCount);
   REQUEST_HANDLER = null;
+
+  console.log('\n[27] inline links (v1.5.0): in-place wrapping, widened matching, exclusions');
+  async function runSuggestLinks(rig, active, text) {
+    const p = new PluginClass(rig.app, manifest);
+    await p.onload();
+    await flush();
+    MODALS.length = 0;
+    NOTICES.length = 0;
+    const ed = new MockEditor(text);
+    await p._commands.find((c) => c.id === 'suggest-links').editorCallback(ed, { file: active });
+    await flushMany();
+    return ed;
+  }
+  function linkRigFor(basenames, caches) {
+    const files = basenames.map((b) => mkStatFile(b, nowMs - DAY, nowMs - DAY));
+    const rig = makeBacklogRig(files, {}, caches || {}, null, files[0].path);
+    return { rig, files };
+  }
+
+  // Alias mentions wrap as [[Note|alias]]; the best-matching form per note wins.
+  {
+    const { rig, files } = linkRigFor(['Inline Host', 'Garden Guide'],
+      { 'Garden Guide.md': { frontmatter: { aliases: ['Garden Handbook'] } } });
+    const ed = await runSuggestLinks(rig, files[0],
+      'Garden Guide is mentioned once. The garden handbook helps, and the Garden Handbook helps again.');
+    check('alias scenario opens the checklist modal', MODALS.length === 1, 'modals: ' + MODALS.length);
+    confirmLatestModal('Insert selected');
+    check('alias mentions wrapped in place as [[Garden Guide|Garden Handbook]]',
+      (ed.text.match(/\[\[Garden Guide\|Garden Handbook\]\]/g) || []).length === 2, ed.text);
+    check('the single title mention is left plain (alias was the best match for the note)',
+      ed.text.startsWith('Garden Guide is mentioned once.'), ed.text);
+  }
+
+  // Plural handling, both directions, preserving the surface text.
+  {
+    const { rig, files } = linkRigFor(['Plural Host', 'Garden Beds']);
+    const ed = await runSuggestLinks(rig, files[0], 'One garden bed was planted early.');
+    confirmLatestModal('Insert selected');
+    check('plural title matches a singular mention, surface preserved',
+      ed.text.includes('One [[Garden Beds|garden bed]] was planted early.'), ed.text);
+  }
+  {
+    const { rig, files } = linkRigFor(['Plural Host', 'Compost Pile']);
+    const ed = await runSuggestLinks(rig, files[0], 'Two compost piles steamed in the cold.');
+    confirmLatestModal('Insert selected');
+    check('singular title matches a plural mention, surface preserved',
+      ed.text.includes('Two [[Compost Pile|compost piles]] steamed'), ed.text);
+  }
+
+  // Hyphen/space variation in a multi-word title.
+  {
+    const { rig, files } = linkRigFor(['Hyphen Host', 'Alpha Harvest']);
+    const ed = await runSuggestLinks(rig, files[0], 'The alpha-harvest festival opened.');
+    confirmLatestModal('Insert selected');
+    check('hyphenated surface matches a spaced title, surface preserved',
+      ed.text.includes('The [[Alpha Harvest|alpha-harvest]] festival opened.'), ed.text);
+  }
+
+  // Exclusions: frontmatter, fenced code, inline code, existing links, markdown links, URLs.
+  {
+    const { rig, files } = linkRigFor(['Secret Host', 'Secret Topic']);
+    const text = [
+      '---', 'title: Secret Topic notes', '---', '# Secret Host', '',
+      'The Secret Topic is discussed here.', '',
+      '```', 'Secret Topic in a fence', '```', '',
+      '`Secret Topic` inline.', '',
+      'Already [[Secret Topic]] linked.', '',
+      '[Secret Topic](https://example.com/secret) is a markdown link.', '',
+      'Visit https://example.com/Secret-Topic today.',
+    ].join('\n');
+    const ed = await runSuggestLinks(rig, files[0], text);
+    confirmLatestModal('Insert selected');
+    check('only the plain mention is wrapped (exactly one new link)',
+      (ed.text.match(/\[\[Secret Topic\]\]/g) || []).length === 2 &&
+      ed.text.includes('The [[Secret Topic]] is discussed here.'), ed.text);
+    check('frontmatter mention NOT wrapped', ed.text.includes('title: Secret Topic notes'), ed.text);
+    check('fenced code mention NOT wrapped', ed.text.includes('```\nSecret Topic in a fence\n```'), ed.text);
+    check('inline code mention NOT wrapped', ed.text.includes('`Secret Topic` inline.'), ed.text);
+    check('markdown link and URL mentions NOT wrapped',
+      ed.text.includes('[Secret Topic](https://example.com/secret)') &&
+      ed.text.includes('https://example.com/Secret-Topic'), ed.text);
+  }
+
+  // Re-running on the wrapped output wraps nothing twice.
+  {
+    const { rig, files } = linkRigFor(['Plural Host', 'Compost Pile']);
+    const ed = await runSuggestLinks(rig, files[0], 'Two compost piles steamed in the cold.');
+    confirmLatestModal('Insert selected');
+    const once = ed.text;
+    const ed2 = await runSuggestLinks(rig, files[0], once);
+    check('re-run finds no unlinked mentions in its own output',
+      NOTICES.some((n) => n.includes('no unlinked')), NOTICES.join(' | '));
+    check('re-run leaves the text byte-identical (no duplicate wrapping)', ed2.text === once, ed2.text);
+  }
+
+  // Widening stays conservative: no substring, prefix or partial-title matches.
+  {
+    const { rig, files } = linkRigFor(['Strict Host', 'Garden Guide']);
+    const ed = await runSuggestLinks(rig, files[0],
+      'The garden guided tour differs, and Garden alone is not the full title.');
+    check('no suggestion for near-miss or partial-title text',
+      MODALS.length === 0 && NOTICES.some((n) => n.includes('no unlinked')),
+      'modals: ' + MODALS.length + ' / ' + NOTICES.join(' | '));
+    check('near-miss note untouched', !ed.text.includes('[['), ed.text);
+  }
+
+  // Offline guarantee for the new path.
+  {
+    let linkRequests = 0;
+    REQUEST_HANDLER = () => { linkRequests += 1; throw new Error('network disabled in test'); };
+    const { rig, files } = linkRigFor(['Offline Host', 'Compost Pile']);
+    const ed = await runSuggestLinks(rig, files[0], 'Two compost piles steamed in the cold.');
+    confirmLatestModal('Insert selected');
+    check('inline linking completes with the network handler armed to fail',
+      ed.text.includes('[[Compost Pile|compost piles]]'), ed.text);
+    check('zero network requests were made by inline linking', linkRequests === 0, 'requests: ' + linkRequests);
+    REQUEST_HANDLER = null;
+  }
 
   console.log('\n' + '='.repeat(56));
   console.log('  PASSED: ' + passed + '   FAILED: ' + failed);
