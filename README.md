@@ -1,6 +1,6 @@
 # Elias HiveMind
 
-Summaries, tag suggestions and link suggestions for Obsidian, working offline by default and using a local Ollama model when you want one.
+Summaries, tag suggestions, link suggestions and a weekly backlog digest for Obsidian, working offline by default and using a local Ollama model when you want one.
 
 New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language steps from install to your first Backlog Digest.
 
