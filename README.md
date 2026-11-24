@@ -476,3 +476,10 @@ shelf — local-first tools, verified working before they are trusted:
   stale seals.
 - **[nova-ops-nim-mcp](https://github.com/elias-hivemind/nova-ops-nim-mcp)** —
   an MCP server for NIM video generation, built for MCP clients.
+
+## Writing
+
+Nova Ops writes up its builds and what they taught us on dev.to —
+[@eliashivemind](https://dev.to/eliashivemind): MCP tool costs,
+fail-closed release engineering, and offline-first tooling, written
+from the work itself.
