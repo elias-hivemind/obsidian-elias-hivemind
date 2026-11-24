@@ -11,7 +11,7 @@ New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language st
 Download: [HiveMind-OS-Vault-v1.zip](https://github.com/elias-hivemind/obsidian-elias-hivemind/releases/download/1.5.0/HiveMind-OS-Vault-v1.zip) (attached to the 1.5.0 release)
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.6.0
+- **Version:** 1.7.0
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -120,6 +120,16 @@ The weekly digest covers what was new this week, and the backlog digest covers c
 - Per note you can **Open** it, **Snooze** it (hidden for 30 days; each later snooze of the same note doubles the interval — 60 days, then 120), or choose **Never show**. Snoozing and dismissing write only the plugin's own data — no note file is ever changed by them.
 - With *Resurface section in weekly digest* on (the default), each weekly digest also carries a **Worth another look** list of the top 3. Switch it off and the digest is exactly what it was before. If nothing has gone cold yet, the modal says so plainly and the digest gains no section.
 
+### Related notes & semantic lookup (local embeddings)
+
+Links record what you connected; embeddings find what you *meant*. Point the plugin at an embedding model on the same local server as the other backend features (Ollama's `nomic-embed-text` by default; LM Studio, llama.cpp and Jan expose an embeddings endpoint too) and it can rank your notes by meaning instead of by shared words:
+
+- **Build embedding index (local server)** embeds every note with text — the digest note, the configuration folder and your ignored folders excluded — and stores the vectors in the plugin's own `data.json`, on this device only. Rebuilds are incremental: only notes whose text changed are re-embedded, deleted or emptied notes drop out, and switching the *Embedding model* rebuilds the index, because vectors from different models are not comparable. A long first build saves after every batch, so an interruption keeps what already landed.
+- **Related notes for current note (semantic)** ranks the rest of the vault against the open note by cosine similarity and shows the top matches, each with its similarity as a percentage, ready to open.
+- **Semantic lookup: find notes by meaning** embeds a phrase you type and ranks the whole vault against it — the notes about a topic, including the ones that never use the topic's words.
+
+Honest costs: the first index of a large vault takes a while on a local server (a ~5,000-note vault is tens of minutes), and embedding is the heaviest thing the plugin does — on mobile, build the index on desktop and let it sync, or expect a slow, warm phone. With no local server running, all three commands fail plainly and change nothing; every other feature works exactly as before, fully offline.
+
 ---
 
 ## Privacy
@@ -130,6 +140,7 @@ The weekly digest covers what was new this week, and the backlog digest covers c
 - **Backlog digest** reads the clippings in your backlog folders or carrying a backlog tag (their content, to summarize and classify them) and the notes you touched in the last seven days (to judge relevance), only when you run a digest command. Tag-based selection reads only the metadata cache's tag list, never file content. It writes only the digest note. The four **Backlog:** processing commands write or move only the one note you run them on — a tag merge, mentions wrapped in wikilinks in place, a `hivemind-read: true` frontmatter marker, or a move into your archive folder — and only when you run them.
 - **Housekeeping sweep** reads the notes in the scope you pick (their content, to compute tag suggestions) only when you run the command and choose that scope, and writes only the frontmatter tag merges you approve in its review — nothing is written by the scan itself. Vault-aware tag suggestions additionally read the metadata cache's tag list for the whole vault, never note content.
 - **Resurface forgotten notes** reads note modification times, the metadata cache's link map and tag list, and — only when you run the command or a digest — the content of cold notes and of notes touched in the last 30 days, to judge relevance. It makes no network requests. Snoozing or dismissing a note writes only the plugin's own data file; no note is changed.
+- **Embedding commands** send a note's plain text (first 4,000 characters, frontmatter and code blocks removed) to the embedding endpoint of the **Backend URL** you configured — the same local server as the other backend commands — only when you run one of the three commands or click *Build index* in settings. The returned vectors are stored only in the plugin's own `data.json`, on this device. Nothing is sent anywhere else, and no embedding request is ever made in the background.
 - **Backlog themes**, only if you switch *Backlog themes via backend* on, sends the clippings' titles and summaries (not their full text) to the **Backend URL** you configure — the same local server as the other backend commands. With the setting off, no backlog request is ever made.
 - **Backend commands** send the note's plain text, with frontmatter and code blocks removed, to the **Backend URL** you configure. The default is `http://127.0.0.1:11434/api/generate`, a local Ollama server, so the text doesn't leave your computer unless you change that URL.
 - **Opening the settings tab** sends one request to the same server for its list of installed models. No note content is included.
@@ -312,6 +323,9 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 | Weekly digest (local) | None | Summarizes the notes created or modified in the last seven days into `Weekly Digest.md`. |
 | Backlog digest | None¹ | Digests the unread clippings in your backlog folders (or carrying a backlog tag) into the "Your backlog" section of `Weekly Digest.md`: summary, tags, read time, age, bucketed by relevance. |
 | Resurface forgotten notes | None | Opens a review of the notes that have gone cold — untouched past the cold threshold, ranked by backlinks and overlap with your last 30 days of notes — to open, snooze or dismiss. The weekly digest carries the top 3 as "Worth another look". |
+| Build embedding index (local server) | Backend URL | Embeds every note with text into the on-device index (incremental: only changed notes are re-embedded; a model change rebuilds). |
+| Related notes for current note (semantic) | Backend URL | Ranks the vault against the open note by embedding similarity and shows the top matches with their similarity. |
+| Semantic lookup: find notes by meaning | Backend URL | Embeds a phrase you type and ranks the whole vault against it. |
 | Backlog: apply suggested tags to current note | None | Suggests tags for the open clipping and merges the ones you pick into its frontmatter. Only on a backlog clipping. |
 | Backlog: link current note to the notes it mentions | None | Wraps the unlinked mentions you pick in wikilinks in place in the open clipping. Only on a backlog clipping. |
 | Backlog: mark current note as read | None | Writes `hivemind-read: true` into the open clipping's frontmatter, so it drops out of later digests. Only on a backlog clipping. |
@@ -387,6 +401,16 @@ The prompts sent to the model are editable in the settings tab, in the **Prompts
 | Tag prompt (`tagPrompt`) | `Suggest up to {{n}} short topic tags for the following note. Return only a comma-separated list of lowercase tags, with no preamble.` followed by the content |
 
 Tag replies are split on commas and new lines. Leading list markers (`-`, `*`, `1.`) are removed before each tag is normalised.
+
+### Embeddings
+
+| Setting | Default | Description |
+|---|---|---|
+| Embedding model | `nomic-embed-text` | The embedding model on your local server. Changing it rebuilds the index on the next build. |
+| Related notes shown | `5` | How many matches the related-notes and lookup results show (1–10). |
+| Build index *(button)* | — | Runs *Build embedding index* and reports how many notes were embedded, removed and indexed. |
+
+The index itself — one vector per note, plus the model it was built with — is stored in the plugin's own `data.json`, like the Resurface snooze records; it has no other settings-tab control and never touches a note.
 
 ---
 

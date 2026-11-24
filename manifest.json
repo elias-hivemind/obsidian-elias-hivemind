@@ -1,9 +1,9 @@
 {
   "id": "elias-hivemind",
   "name": "Elias HiveMind",
-  "version": "1.6.0",
+  "version": "1.7.0",
   "minAppVersion": "1.0.0",
-  "description": "Summarize notes, suggest tags, link mentions in place, digest your clippings backlog and resurface forgotten notes, offline or with a local backend (Ollama, LM Studio, llama.cpp or Jan).",
+  "description": "Summarize notes, suggest tags, link mentions in place, digest your clippings backlog, resurface forgotten notes and find related notes by meaning, offline or with a local backend (Ollama, LM Studio, llama.cpp or Jan).",
   "author": "Elias HiveMind",
   "isDesktopOnly": false
 }

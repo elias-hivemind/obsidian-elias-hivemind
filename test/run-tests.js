@@ -357,6 +357,9 @@ async function main() {
     'backlog-archive',
     'backlog-link',
     'resurface-forgotten-notes',
+    'build-embedding-index',
+    'related-notes',
+    'semantic-lookup',
     'test-backend-connection',
   ];
   expected.forEach((id) => check('registered command: ' + id, ids.includes(id), 'got: ' + ids.join(', ')));
@@ -635,17 +638,18 @@ async function main() {
   const groups = defs.map((d) => d.heading);
   // v1.6.0: a seventh group, Prompts, joins between Backend and Tags
   // (expected value changed for the new group - documented in the build report).
-  check('seven groups, in display() order',
-    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Prompts', 'Tags', 'Link suggestion', 'Backlog', 'Resurface']),
+  // v1.7.0: an eighth group, Embeddings, joins between Prompts and Tags.
+  check('eight groups, in display() order',
+    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Prompts', 'Embeddings', 'Tags', 'Link suggestion', 'Backlog', 'Resurface']),
     JSON.stringify(groups));
 
   const allItems = defs.flatMap((g) => g.items || []);
   const controlKeys = allItems.filter((i) => i.control).map((i) => i.control.key).sort();
   const expectedKeys = [
     'backendFormat', 'backendTimeoutMs', 'backendUrl', 'backlogArchiveFolder',
-    'backlogFolders', 'backlogStaleDays', 'backlogTags', 'backlogThemesViaBackend', 'fallbackToLocal',
+    'backlogFolders', 'backlogStaleDays', 'backlogTags', 'backlogThemesViaBackend', 'embeddingModel', 'fallbackToLocal',
     'ignoreFolders', 'insertMode', 'maxLinkSuggestions', 'maxTags',
-    'minTitleLength', 'resurfaceColdDays', 'resurfaceInDigest', 'resurfaceQueueSize',
+    'minTitleLength', 'relatedNotesCount', 'resurfaceColdDays', 'resurfaceInDigest', 'resurfaceQueueSize',
     'summaryHeading', 'summarySentenceCount',
   ];
   // v1.6.0: backendModel, backendPrompt and tagPrompt are render rows, not
@@ -2186,6 +2190,281 @@ async function main() {
     check('inline linking completes with the network handler armed to fail',
       ed.text.includes('[[Compost Pile|compost piles]]'), ed.text);
     check('zero network requests were made by inline linking', linkRequests === 0, 'requests: ' + linkRequests);
+    REQUEST_HANDLER = null;
+  }
+
+  console.log('\n[27] embeddings: local-server index, related notes, semantic lookup');
+  // A deterministic fake embedding server: a text's vector counts its
+  // 'compost' and 'timber' mentions, plus a constant - so every cosine
+  // ranking below is computable by hand and asserted exactly.
+  function fakeVector(text) {
+    const lower = String(text).toLowerCase();
+    const count = (word) => lower.split(word).length - 1;
+    return [count('compost'), count('timber'), 1];
+  }
+  function ollamaEmbedHandler(record) {
+    return async (param) => {
+      const body = JSON.parse(param.body);
+      record.push({ url: param.url, body });
+      if (Array.isArray(body.input) && body.input.length === 1) {
+        // Legacy single-text shape, exercised by the lookup's query embed.
+        return { status: 200, headers: {}, text: '', json: { embedding: fakeVector(body.input[0]) } };
+      }
+      return { status: 200, headers: {}, text: '', json: { embeddings: body.input.map(fakeVector) } };
+    };
+  }
+  function makeEmbeddingRig(activePath) {
+    const files = [
+      mkFile('Compost Guide'),
+      mkFile('Compost Schedule'),
+      mkFile('Timber Orders'),
+      mkFile('Empty Note'),
+      mkFile('Template Scratch', 'templates'),
+    ];
+    const contents = {
+      'Compost Guide.md': 'compost compost compost compost weekly turning notes',
+      'Compost Schedule.md': 'compost compost seasonal planting calendar',
+      'Timber Orders.md': 'timber timber timber order arrives friday',
+      'Empty Note.md': '',
+      'templates/Template Scratch.md': 'compost compost compost scratchings',
+      'Weekly Digest.md': 'compost compost digest body',
+    };
+    const rig = makeBacklogRig(files, contents, {}, 'digest present', activePath);
+    rig.contents = contents;
+    rig.store.opened = [];
+    rig.app.workspace.getLeaf = () => ({
+      openFile: async (f) => { rig.store.opened.push(f.path); },
+    });
+    return rig;
+  }
+  async function runEmbeddingPlugin(rig, data) {
+    const p = new PluginClass(rig.app, manifest);
+    if (data) p._data = data;
+    await p.onload();
+    await p.loadSettings();
+    NOTICES.length = 0;
+    MODALS.length = 0;
+    return p;
+  }
+
+  // Defaults and settings wiring.
+  {
+    const fresh = new PluginClass(app, manifest);
+    await fresh.onload();
+    check('embedding defaults: local model, five results, empty index',
+      fresh.settings.embeddingModel === 'nomic-embed-text' && fresh.settings.relatedNotesCount === 5 &&
+      JSON.stringify(fresh.settings.embeddingIndex) === '{}' && fresh.settings.embeddingIndexModel === '',
+      fresh.settings.embeddingModel + ' / ' + fresh.settings.relatedNotesCount);
+    const embGroup = tab.getSettingDefinitions().find((g) => g.heading === 'Embeddings');
+    check('the Embeddings group carries the Build index render row',
+      !!embGroup && embGroup.items.some((i) => i.name === 'Build embedding index' && typeof i.render === 'function' && !i.control));
+    tab.setControlValue('embeddingModel', '  mxbai-embed-large  ');
+    check('setControlValue trims the embedding model like the chat model',
+      plugin.settings.embeddingModel === 'mxbai-embed-large', plugin.settings.embeddingModel);
+    tab.setControlValue('embeddingModel', 'nomic-embed-text');
+  }
+
+  // Index build (Ollama shape), then the incremental rules.
+  {
+    const requests = [];
+    REQUEST_HANDLER = ollamaEmbedHandler(requests);
+    const rig = makeEmbeddingRig(null);
+    const p = await runEmbeddingPlugin(rig);
+    const build = () => p._commands.find((c) => c.id === 'build-embedding-index').callback();
+
+    build();
+    await flushMany();
+    check('index build posts to the Ollama embed endpoint',
+      requests.length === 1 && requests[0].url === 'http://127.0.0.1:11434/api/embed',
+      JSON.stringify(requests.map((r) => r.url)));
+    check('the embed request carries the configured model', requests[0].body.model === 'nomic-embed-text');
+    check('only notes with text, outside ignored folders and the digest, are embedded',
+      JSON.stringify(requests[0].body.input) === JSON.stringify([
+        'compost compost compost compost weekly turning notes',
+        'compost compost seasonal planting calendar',
+        'timber timber timber order arrives friday',
+      ]), JSON.stringify(requests[0].body.input));
+    check('the index holds one entry per embedded note',
+      JSON.stringify(Object.keys(p.settings.embeddingIndex).sort()) ===
+      JSON.stringify(['Compost Guide.md', 'Compost Schedule.md', 'Timber Orders.md']),
+      JSON.stringify(Object.keys(p.settings.embeddingIndex)));
+    check('stored vectors are the server vectors',
+      JSON.stringify(p.settings.embeddingIndex['Compost Guide.md'].vector) === '[4,0,1]',
+      JSON.stringify(p.settings.embeddingIndex['Compost Guide.md']));
+    check('the index records the model it was built with', p.settings.embeddingIndexModel === 'nomic-embed-text');
+    check('the build notice reports the counts',
+      NOTICES.some((n) => n.includes('3 notes indexed (3 embedded, 0 removed)')), NOTICES.join(' | '));
+
+    requests.length = 0;
+    NOTICES.length = 0;
+    build();
+    await flushMany();
+    check('an unchanged vault re-embeds nothing', requests.length === 0, 'requests: ' + requests.length);
+    check('the rebuild notice says so', NOTICES.some((n) => n.includes('(0 embedded, 0 removed)')));
+
+    rig.contents['Timber Orders.md'] = 'timber timber compost delivery';
+    requests.length = 0;
+    build();
+    await flushMany();
+    check('one changed note re-embeds exactly that note',
+      requests.length === 1 && JSON.stringify(requests[0].body.input) === JSON.stringify(['timber timber compost delivery']),
+      JSON.stringify(requests.map((r) => r.body.input)));
+    check('the changed note vector updated',
+      JSON.stringify(p.settings.embeddingIndex['Timber Orders.md'].vector) === '[1,2,1]');
+
+    rig.contents['Compost Schedule.md'] = '';
+    requests.length = 0;
+    NOTICES.length = 0;
+    build();
+    await flushMany();
+    check('an emptied note drops out of the index', !('Compost Schedule.md' in p.settings.embeddingIndex));
+    check('the removal is reported', NOTICES.some((n) => n.includes('(0 embedded, 1 removed)')), NOTICES.join(' | '));
+
+    rig.contents['Compost Schedule.md'] = 'compost compost seasonal planting calendar';
+    p.settings.embeddingModel = 'mxbai-embed-large';
+    requests.length = 0;
+    build();
+    await flushMany();
+    check('a model change re-embeds the whole vault',
+      requests.length === 1 && requests[0].body.input.length === 3 && requests[0].body.model === 'mxbai-embed-large',
+      JSON.stringify(requests.map((r) => r.body)));
+    check('the index model follows the setting', p.settings.embeddingIndexModel === 'mxbai-embed-large');
+
+    const revived = new PluginClass(rig.app, manifest);
+    revived._data = p._data;
+    await revived.onload();
+    await revived.loadSettings();
+    check('the index survives a settings round-trip',
+      Object.keys(revived.settings.embeddingIndex).length === 3 &&
+      revived.settings.embeddingIndexModel === 'mxbai-embed-large',
+      JSON.stringify(Object.keys(revived.settings.embeddingIndex)));
+    REQUEST_HANDLER = null;
+  }
+
+  // Related notes: ranking, labels, Open.
+  {
+    const requests = [];
+    REQUEST_HANDLER = ollamaEmbedHandler(requests);
+    const rig = makeEmbeddingRig('Compost Guide.md');
+    const p = await runEmbeddingPlugin(rig);
+    const guide = rig.app.vault.getMarkdownFiles().find((f) => f.path === 'Compost Guide.md');
+    p._commands.find((c) => c.id === 'related-notes').editorCallback(new MockEditor(''), { file: guide });
+    await flushMany();
+    const modal = MODALS[MODALS.length - 1];
+    check('related notes opens a results modal titled for the current note',
+      !!modal && modal.titleEl.textContent === 'Related to "Compost Guide"',
+      modal ? modal.titleEl.textContent : 'no modal');
+    check('related notes rank by cosine similarity',
+      JSON.stringify(modalTitles(modal)) === JSON.stringify(['Compost Schedule', 'Timber Orders']),
+      JSON.stringify(modalTitles(modal)));
+    const whys = modalWhys(modal);
+    check('similarity labels are the true cosines',
+      whys.length === 2 && whys[0].startsWith('98% similar') && whys[1].startsWith('8% similar'),
+      JSON.stringify(whys));
+    modalButtons(modal).filter((b) => b.textContent === 'Open')[0].click();
+    await flushMany();
+    check('Open opens the related note',
+      JSON.stringify(rig.store.opened) === JSON.stringify(['Compost Schedule.md']),
+      JSON.stringify(rig.store.opened));
+    REQUEST_HANDLER = null;
+  }
+
+  // Semantic lookup: the query is embedded (legacy single-vector shape)
+  // and the whole index ranks against it.
+  {
+    const requests = [];
+    REQUEST_HANDLER = ollamaEmbedHandler(requests);
+    const rig = makeEmbeddingRig(null);
+    const p = await runEmbeddingPlugin(rig);
+    p._commands.find((c) => c.id === 'semantic-lookup').callback();
+    await flushMany();
+    const modal = MODALS[MODALS.length - 1];
+    check('semantic lookup opens its modal',
+      !!modal && modal.titleEl.textContent === 'Semantic lookup',
+      modal ? modal.titleEl.textContent : 'no modal');
+    const input = modalNodes(modal).find((n) => n.tagName === 'INPUT');
+    input.value = 'compost';
+    modalButtons(modal).find((b) => b.textContent === 'Search').click();
+    await flushMany();
+    check('lookup ranks the vault against the query vector',
+      JSON.stringify(modalTitles(modal)) === JSON.stringify(['Compost Schedule', 'Compost Guide', 'Timber Orders']),
+      JSON.stringify(modalTitles(modal)));
+    const whys = modalWhys(modal);
+    check('lookup similarity labels are the true cosines',
+      whys.length === 3 && whys[0].startsWith('95% similar') && whys[1].startsWith('86% similar') && whys[2].startsWith('22% similar'),
+      JSON.stringify(whys));
+    REQUEST_HANDLER = null;
+  }
+
+  // OpenAI-compatible shape: /v1/embeddings URL, data[] response.
+  {
+    const requests = [];
+    REQUEST_HANDLER = async (param) => {
+      const body = JSON.parse(param.body);
+      requests.push({ url: param.url, body });
+      return {
+        status: 200, headers: {}, text: '',
+        json: { data: body.input.map((t, i) => ({ embedding: fakeVector(t), index: i })) },
+      };
+    };
+    const rig = makeEmbeddingRig(null);
+    const p = await runEmbeddingPlugin(rig);
+    p.settings.backendFormat = 'openai';
+    p.settings.backendUrl = 'http://127.0.0.1:1234/v1/chat/completions';
+    p._commands.find((c) => c.id === 'build-embedding-index').callback();
+    await flushMany();
+    check('OpenAI-compatible servers are called at /v1/embeddings',
+      requests.length === 1 && requests[0].url === 'http://127.0.0.1:1234/v1/embeddings',
+      JSON.stringify(requests.map((r) => r.url)));
+    check('the data-shape response fills the index', Object.keys(p.settings.embeddingIndex).length === 3);
+    REQUEST_HANDLER = null;
+  }
+
+  // Failure honesty: a dead server, and a count-mismatched response.
+  {
+    REQUEST_HANDLER = async () => ({ status: 500, headers: {}, text: 'model missing', json: null });
+    const rig = makeEmbeddingRig(null);
+    const p = await runEmbeddingPlugin(rig);
+    p._commands.find((c) => c.id === 'build-embedding-index').callback();
+    await flushMany();
+    check('a dead embedding server fails the build honestly',
+      NOTICES.some((n) => n.includes('embedding index failed')), NOTICES.join(' | '));
+    check('a failed build leaves the index untouched', Object.keys(p.settings.embeddingIndex).length === 0);
+    NOTICES.length = 0;
+    MODALS.length = 0;
+    const guide = rig.app.vault.getMarkdownFiles().find((f) => f.path === 'Compost Guide.md');
+    p._commands.find((c) => c.id === 'related-notes').editorCallback(new MockEditor(''), { file: guide });
+    await flushMany();
+    check('related notes with a dead server shows no modal, only the failure',
+      MODALS.length === 0 && NOTICES.some((n) => n.includes('related notes failed')), NOTICES.join(' | '));
+    REQUEST_HANDLER = null;
+  }
+  {
+    REQUEST_HANDLER = async () => ({ status: 200, headers: {}, text: '', json: { embeddings: [[1, 0, 1]] } });
+    const rig = makeEmbeddingRig(null);
+    const p = await runEmbeddingPlugin(rig);
+    p._commands.find((c) => c.id === 'build-embedding-index').callback();
+    await flushMany();
+    check('a vector-count mismatch fails instead of corrupting the index',
+      NOTICES.some((n) => n.includes('returned 1 vector(s) for 3 text(s)')) &&
+      Object.keys(p.settings.embeddingIndex).length === 0,
+      NOTICES.join(' | '));
+    REQUEST_HANDLER = null;
+  }
+
+  // The settings tab's Build index button runs the same build.
+  {
+    const requests = [];
+    REQUEST_HANDLER = ollamaEmbedHandler(requests);
+    BUTTONS.length = 0;
+    NOTICES.length = 0;
+    tab.display();
+    const buildButton = BUTTONS.find((b) => b._text === 'Build index');
+    check('settings renders a Build index button', !!buildButton);
+    if (buildButton) buildButton._onClick();
+    await flushMany();
+    check('the settings button runs the build (empty-text vault: nothing to embed)',
+      NOTICES.some((n) => n.includes('embedding index ready — 0 notes indexed')), NOTICES.join(' | '));
     REQUEST_HANDLER = null;
   }
 

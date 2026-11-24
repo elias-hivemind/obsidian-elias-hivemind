@@ -56,6 +56,17 @@
  *       digest can carry the top three. Snoozing or dismissing a note
  *       writes only plugin-internal state, never a note file.
  *
+ *   Related notes & semantic lookup
+ *     - semantic, via the user's OWN local server only: an embedding index
+ *       of the vault is built by the configured local backend (Ollama
+ *       /api/embed, or an OpenAI-compatible /v1/embeddings), stored in the
+ *       plugin's own data, and kept fresh by content hash. "Related notes"
+ *       ranks the vault against the current note by cosine similarity;
+ *       "Semantic lookup" does the same for a typed phrase. No cloud
+ *       endpoint, no API key, no telemetry - and no local approximation
+ *       pretending to be semantic: with no local server running, these
+ *       commands say so and stop.
+ *
  * Obsidian loads this file as CommonJS and instantiates the default export.
  */
 
@@ -127,6 +138,22 @@ interface EliasHiveMindSettings {
   resurfaceSnoozes: Record<string, ResurfaceSnooze>;
   /** Internal state: paths the user chose to never resurface again. */
   resurfaceNeverShow: string[];
+  /** Model the user's local server uses for embeddings. */
+  embeddingModel: string;
+  /** How many notes Related notes / Semantic lookup show at once. */
+  relatedNotesCount: number;
+  /**
+   * Internal state, not user settings (no settings-tab controls), following
+   * the resurfaceSnoozes precedent: the semantic index, one entry per note
+   * path - the content hash of the exact text that was embedded (so a
+   * changed note is re-embedded and an unchanged one is not) and the
+   * vector the user's own local server returned for it. Vectors are
+   * computed on the user's machine and stored only here, in the plugin's
+   * own data; nothing about them is transmitted anywhere.
+   */
+  embeddingIndex: Record<string, EmbeddingIndexEntry>;
+  /** The embedding model the stored index was built with ('' = no index). */
+  embeddingIndexModel: string;
 }
 
 const DEFAULT_SETTINGS: EliasHiveMindSettings = {
@@ -161,6 +188,10 @@ const DEFAULT_SETTINGS: EliasHiveMindSettings = {
   resurfaceInDigest: true,
   resurfaceSnoozes: {},
   resurfaceNeverShow: [],
+  embeddingModel: 'nomic-embed-text',
+  relatedNotesCount: 5,
+  embeddingIndex: {},
+  embeddingIndexModel: '',
 };
 
 /* ========================================================================== */
@@ -568,6 +599,265 @@ async function listBackendModels(settings: EliasHiveMindSettings): Promise<strin
   }
 
   return Array.from(names).sort((a, b) => a.localeCompare(b));
+}
+
+/* ========================================================================== */
+/*                                embeddings                                  */
+/* ========================================================================== */
+
+/**
+ * Local embeddings - the semantic layer. Vectors are computed ONLY by the
+ * server the user runs on their own machine (the same backend settings as
+ * generation: Ollama's /api/embed, or an OpenAI-compatible /v1/embeddings
+ * on LM Studio / llama.cpp / Jan), and the index lives in the plugin's own
+ * stored data. Nothing is sent anywhere else, ever. With no local server
+ * running these functions throw, the commands say so, and nothing falls
+ * back to a local approximation pretending to be semantic.
+ */
+
+/** One indexed note: the hash of the embedded text, and its vector. */
+interface EmbeddingIndexEntry {
+  hash: string;
+  vector: number[];
+}
+
+/** Characters of a note's plain text sent to the embedding model. */
+const EMBEDDING_TEXT_MAX_CHARS = 4000;
+
+/** Notes embedded per request - bounded so a single request stays small. */
+const EMBEDDING_BATCH_SIZE = 16;
+
+/**
+ * Derives the embeddings endpoint from the generation URL, the same way
+ * modelListUrl derives the model list: Ollama serves /api/embed at the
+ * server root, OpenAI-compatible servers serve <prefix>/v1/embeddings.
+ */
+function embeddingUrl(settings: EliasHiveMindSettings): string {
+  let url: URL;
+  try {
+    url = new URL(settings.backendUrl);
+  } catch {
+    throw new Error(`Backend URL is not a valid URL: "${settings.backendUrl}".`);
+  }
+
+  if (settings.backendFormat === 'openai') {
+    const idx = url.pathname.indexOf('/v1/');
+    const prefix = idx === -1 ? '/v1' : url.pathname.slice(0, idx + 3);
+    return `${url.origin}${prefix}/embeddings`;
+  }
+  return `${url.origin}/api/embed`;
+}
+
+/** A value is a usable vector when it is a non-empty array of finite numbers. */
+function asVector(value: unknown): number[] | null {
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const vector: number[] = [];
+  for (const component of value) {
+    if (typeof component !== 'number' || !Number.isFinite(component)) return null;
+    vector.push(component);
+  }
+  return vector;
+}
+
+/**
+ * Pulls embedding vectors out of the response shapes local servers use:
+ * Ollama /api/embed answers { embeddings: [[...], ...] }, Ollama's legacy
+ * /api/embeddings answers a single { embedding: [...] }, and
+ * OpenAI-compatible servers answer { data: [{ embedding: [...], index }] }
+ * (sorted by index, as the spec allows them to arrive out of order).
+ * Malformed entries are dropped; an unusable payload yields [].
+ */
+function extractEmbeddingVectors(payload: unknown): number[][] {
+  if (!payload || typeof payload !== 'object') return [];
+  const obj = payload as Record<string, unknown>;
+
+  if (Array.isArray(obj.embeddings)) {
+    const vectors: number[][] = [];
+    for (const entry of obj.embeddings) {
+      const vector = asVector(entry);
+      if (vector) vectors.push(vector);
+    }
+    return vectors;
+  }
+
+  const single = asVector(obj.embedding);
+  if (single) return [single];
+
+  if (Array.isArray(obj.data)) {
+    const rows: Array<{ index: number; vector: number[] }> = [];
+    obj.data.forEach((entry, position) => {
+      if (!entry || typeof entry !== 'object') return;
+      const row = entry as Record<string, unknown>;
+      const vector = asVector(row.embedding);
+      if (!vector) return;
+      rows.push({
+        index: typeof row.index === 'number' ? row.index : position,
+        vector,
+      });
+    });
+    rows.sort((a, b) => a.index - b.index);
+    return rows.map((row) => row.vector);
+  }
+
+  return [];
+}
+
+/**
+ * Embeds a batch of texts with the user's local server and returns one
+ * vector per text, in order. Throws on any failure - an unreachable
+ * server, an HTTP error, a count or dimension mismatch - because a
+ * partial or mismatched batch would silently corrupt the index.
+ */
+async function embedTextsViaBackend(
+  settings: EliasHiveMindSettings,
+  texts: string[]
+): Promise<number[][]> {
+  const model = settings.embeddingModel.trim();
+  if (!model) throw new Error('No embedding model is set.');
+
+  const response = await requestWithTimeout(
+    {
+      url: embeddingUrl(settings),
+      method: 'POST',
+      contentType: 'application/json',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model, input: texts }),
+    },
+    settings.backendTimeoutMs
+  );
+
+  if (response.status >= 400) {
+    throw new Error(
+      `Embedding backend returned HTTP ${response.status}. ${response.text.slice(0, 300)}`
+    );
+  }
+
+  const vectors = extractEmbeddingVectors(safeJson(response));
+  if (vectors.length !== texts.length) {
+    throw new Error(
+      `Embedding backend returned ${vectors.length} vector(s) for ${texts.length} text(s).`
+    );
+  }
+  const dims = vectors.length > 0 ? vectors[0].length : 0;
+  if (vectors.some((vector) => vector.length !== dims)) {
+    throw new Error('Embedding backend returned vectors with inconsistent dimensions.');
+  }
+  return vectors;
+}
+
+/** FNV-1a 32-bit hash of a string, as 8 hex chars. Deterministic and local. */
+function contentHash(text: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * The exact text a note is embedded as: its plain text, whitespace
+ * collapsed, capped at EMBEDDING_TEXT_MAX_CHARS. The index stores the
+ * content hash of this string, so the hash and the embedded text can
+ * never drift apart.
+ */
+function embeddingSourceText(markdown: string): string {
+  return toPlainText(markdown)
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, EMBEDDING_TEXT_MAX_CHARS);
+}
+
+/** Cosine similarity; 0 for mismatched lengths or a zero-length vector. */
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length === 0 || a.length !== b.length) return 0;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  if (normA === 0 || normB === 0) return 0;
+  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
+}
+
+/** What an index refresh must do: embed these paths, drop these paths. */
+interface EmbeddingPlan {
+  toEmbed: string[];
+  toRemove: string[];
+}
+
+/**
+ * Plans an incremental index refresh. A note is (re-)embedded when it is
+ * missing from the index or its content hash moved; an index entry is
+ * removed when its note no longer exists (or no longer has embeddable
+ * text, which keeps it out of `entries`). A model change re-embeds
+ * everything: vectors from different models are not comparable, even at
+ * the same dimension. Both lists are path-sorted so the plan is
+ * deterministic for a given vault state.
+ */
+function planEmbeddingIndex(
+  entries: Array<{ path: string; hash: string }>,
+  index: Record<string, EmbeddingIndexEntry>,
+  indexModel: string,
+  model: string
+): EmbeddingPlan {
+  const current = new Set(entries.map((entry) => entry.path));
+  const toRemove = Object.keys(index)
+    .filter((path) => !current.has(path))
+    .sort();
+  const modelChanged = indexModel !== model;
+  const toEmbed = entries
+    .filter(
+      (entry) => modelChanged || !index[entry.path] || index[entry.path].hash !== entry.hash
+    )
+    .map((entry) => entry.path)
+    .sort();
+  return { toEmbed, toRemove };
+}
+
+/** One note ranked against a query vector. */
+interface RelatedNote {
+  path: string;
+  basename: string;
+  score: number;
+}
+
+/** The display name for a vault path: last segment, .md stripped. */
+function noteBasename(path: string): string {
+  const name = path.split('/').pop() ?? path;
+  return name.replace(/\.md$/i, '');
+}
+
+/**
+ * Ranks every indexed note against a vector by cosine similarity.
+ * The target note itself is excluded, non-positive scores are dropped
+ * (an unrelated note is not a result), and ties break by path so the
+ * ranking is deterministic.
+ */
+function rankRelatedNotes(
+  index: Record<string, EmbeddingIndexEntry>,
+  targetPath: string,
+  vector: number[],
+  limit: number
+): RelatedNote[] {
+  const scored: RelatedNote[] = [];
+  for (const path of Object.keys(index)) {
+    if (path === targetPath) continue;
+    const score = cosineSimilarity(vector, index[path].vector);
+    if (score > 0) scored.push({ path, basename: noteBasename(path), score });
+  }
+  scored.sort(
+    (a, b) => b.score - a.score || (a.path < b.path ? -1 : a.path > b.path ? 1 : 0)
+  );
+  return scored.slice(0, Math.max(0, limit));
+}
+
+/** The similarity label shown beside a related note. */
+function formatSimilarity(score: number): string {
+  return `${Math.round(score * 100)}% similar`;
 }
 
 /* ========================================================================== */
@@ -2419,6 +2709,171 @@ class ResurfaceModal extends Modal {
   }
 }
 
+interface RelatedNotesModalConfig {
+  title: string;
+  intro: string;
+  /** The ranked results, already sliced to the configured count. */
+  items: RelatedNote[];
+  /** Plain statement shown when nothing ranked. */
+  emptyText: string;
+  /** Opens the note in the workspace. The modal closes first. */
+  onOpen: (item: RelatedNote) => void;
+}
+
+/**
+ * Results for Related notes: one row per note - its title, how similar
+ * the local embedding model found it, and its path - with an Open action.
+ * Read-only: nothing is written from this modal, to any note or to the
+ * index.
+ */
+class RelatedNotesModal extends Modal {
+  private readonly config: RelatedNotesModalConfig;
+
+  constructor(app: App, config: RelatedNotesModalConfig) {
+    super(app);
+    this.config = config;
+  }
+
+  onOpen(): void {
+    const { contentEl, titleEl, config } = this;
+    titleEl.setText(config.title);
+    contentEl.empty();
+
+    if (config.items.length === 0) {
+      contentEl.createEl('p', { text: config.emptyText });
+    } else {
+      contentEl.createEl('p', { text: config.intro });
+
+      const list = contentEl.createDiv({ cls: 'ehm-suggestion-list' });
+      config.items.forEach((item) => {
+        const row = list.createDiv({ cls: 'ehm-resurface-row' });
+
+        const main = row.createDiv({ cls: 'ehm-resurface-main' });
+        main.createSpan({ text: item.basename });
+        main.createEl('small', {
+          cls: 'ehm-resurface-why',
+          text: `${formatSimilarity(item.score)} · ${item.path}`,
+        });
+
+        const actions = row.createDiv({ cls: 'ehm-modal-buttons' });
+        const open = actions.createEl('button', { text: 'Open' });
+        open.addEventListener('click', () => {
+          this.close();
+          config.onOpen(item);
+        });
+      });
+    }
+
+    const buttons = contentEl.createDiv({ cls: 'ehm-modal-buttons' });
+    const close = buttons.createEl('button', { cls: 'mod-cta', text: 'Close' });
+    close.addEventListener('click', () => this.close());
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+}
+
+interface SemanticLookupModalConfig {
+  intro: string;
+  /** Embeds the query and ranks the index; throws when the server fails. */
+  onSearch: (query: string) => Promise<RelatedNote[]>;
+  /** Opens the note in the workspace. The modal closes first. */
+  onOpen: (item: RelatedNote) => void;
+}
+
+/**
+ * Semantic lookup: a text field and a Search button over the embedding
+ * index. Results render under the field with the same rows Related notes
+ * uses. The query is embedded by the user's local server when Search is
+ * pressed - opening this modal makes no request by itself.
+ */
+class SemanticLookupModal extends Modal {
+  private readonly config: SemanticLookupModalConfig;
+  private resultsEl: HTMLElement | null = null;
+
+  constructor(app: App, config: SemanticLookupModalConfig) {
+    super(app);
+    this.config = config;
+  }
+
+  onOpen(): void {
+    const { contentEl, titleEl, config } = this;
+    titleEl.setText('Semantic lookup');
+    contentEl.empty();
+
+    contentEl.createEl('p', { text: config.intro });
+
+    const input = contentEl.createEl('input', {
+      cls: 'ehm-lookup-input',
+      attr: { type: 'text', placeholder: 'Describe what you are looking for...' },
+    });
+
+    const buttons = contentEl.createDiv({ cls: 'ehm-modal-buttons' });
+    const search = buttons.createEl('button', { cls: 'mod-cta', text: 'Search' });
+    search.addEventListener('click', () => {
+      void this.runSearch(input.value);
+    });
+
+    this.resultsEl = contentEl.createDiv();
+  }
+
+  onClose(): void {
+    this.contentEl.empty();
+  }
+
+  private async runSearch(rawQuery: string): Promise<void> {
+    const resultsEl = this.resultsEl;
+    if (!resultsEl) return;
+    const query = rawQuery.trim();
+    resultsEl.empty();
+
+    if (!query) {
+      resultsEl.createEl('p', { text: 'Type what you are looking for, then Search.' });
+      return;
+    }
+
+    resultsEl.createEl('p', { text: 'Searching...' });
+    let items: RelatedNote[];
+    try {
+      items = await this.config.onSearch(query);
+    } catch (error) {
+      resultsEl.empty();
+      resultsEl.createEl('p', {
+        text: `Lookup failed: ${describeError(error)}`,
+      });
+      return;
+    }
+
+    resultsEl.empty();
+    if (items.length === 0) {
+      resultsEl.createEl('p', {
+        text: 'No notes in the index are similar to that. The index only covers notes with readable text, outside the ignored folders.',
+      });
+      return;
+    }
+
+    const list = resultsEl.createDiv({ cls: 'ehm-suggestion-list' });
+    items.forEach((item) => {
+      const row = list.createDiv({ cls: 'ehm-resurface-row' });
+
+      const main = row.createDiv({ cls: 'ehm-resurface-main' });
+      main.createSpan({ text: item.basename });
+      main.createEl('small', {
+        cls: 'ehm-resurface-why',
+        text: `${formatSimilarity(item.score)} · ${item.path}`,
+      });
+
+      const actions = row.createDiv({ cls: 'ehm-modal-buttons' });
+      const open = actions.createEl('button', { text: 'Open' });
+      open.addEventListener('click', () => {
+        this.close();
+        this.config.onOpen(item);
+      });
+    });
+  }
+}
+
 export default class EliasHiveMindPlugin extends Plugin {
   settings: EliasHiveMindSettings = DEFAULT_SETTINGS;
 
@@ -2554,6 +3009,30 @@ export default class EliasHiveMindPlugin extends Plugin {
       name: 'Resurface forgotten notes',
       callback: () => {
         void this.runResurface();
+      },
+    });
+
+    this.addCommand({
+      id: 'build-embedding-index',
+      name: 'Build embedding index (local server)',
+      callback: () => {
+        void this.runBuildEmbeddingIndex();
+      },
+    });
+
+    this.addCommand({
+      id: 'related-notes',
+      name: 'Related notes for current note (semantic)',
+      editorCallback: (editor: Editor, view: MarkdownView) => {
+        void this.runRelatedNotes(editor, view);
+      },
+    });
+
+    this.addCommand({
+      id: 'semantic-lookup',
+      name: 'Semantic lookup: find notes by meaning',
+      callback: () => {
+        void this.runSemanticLookup();
       },
     });
 
@@ -3488,6 +3967,208 @@ export default class EliasHiveMindPlugin extends Plugin {
     new Notice(`Elias HiveMind: "${item.basename}" will not be resurfaced again.`);
   }
 
+  /* ------------------------------------------------------- semantic index */
+
+  /**
+   * The files the semantic index covers: every markdown note outside the
+   * digest note and the ignored folders - the Resurface exclusion shape.
+   */
+  private embeddingCandidateFiles(): TFile[] {
+    const ignored = parseIgnoreFolders(
+      `${this.app.vault.configDir}, ${this.settings.ignoreFolders}`
+    );
+    return this.app.vault.getMarkdownFiles().filter((file) => {
+      const lower = file.path.toLowerCase();
+      return (
+        file.path !== DIGEST_NOTE_PATH &&
+        !ignored.some((folder) => lower.startsWith(folder + '/'))
+      );
+    });
+  }
+
+  /**
+   * Builds or refreshes the embedding index with the user's local server
+   * and persists it in the plugin's own data. Incremental: unchanged
+   * notes are not re-embedded (their content hash still matches), deleted
+   * or emptied notes drop out, and a model change rebuilds everything.
+   * Progress is saved after every batch, so a server failure mid-build
+   * keeps the batches that already landed; the failure itself propagates
+   * to the caller. Returns the run's counts.
+   */
+  async buildEmbeddingIndex(): Promise<{ embedded: number; removed: number; total: number }> {
+    const settings = this.settings;
+    const model = settings.embeddingModel.trim();
+    if (!model) throw new Error('No embedding model is set.');
+
+    const sources = new Map<string, string>();
+    const entries: Array<{ path: string; hash: string }> = [];
+    for (const file of this.embeddingCandidateFiles()) {
+      const source = embeddingSourceText(await this.app.vault.cachedRead(file));
+      if (!source) continue; // No readable text: nothing to embed.
+      sources.set(file.path, source);
+      entries.push({ path: file.path, hash: contentHash(source) });
+    }
+
+    const index: Record<string, EmbeddingIndexEntry> = { ...(settings.embeddingIndex ?? {}) };
+    const plan = planEmbeddingIndex(entries, index, settings.embeddingIndexModel ?? '', model);
+    for (const path of plan.toRemove) delete index[path];
+
+    let embedded = 0;
+    for (let i = 0; i < plan.toEmbed.length; i += EMBEDDING_BATCH_SIZE) {
+      const batch = plan.toEmbed.slice(i, i + EMBEDDING_BATCH_SIZE);
+      const vectors = await embedTextsViaBackend(
+        settings,
+        batch.map((path) => sources.get(path) ?? '')
+      );
+      batch.forEach((path, j) => {
+        index[path] = { hash: contentHash(sources.get(path) ?? ''), vector: vectors[j] };
+      });
+      embedded += batch.length;
+      this.settings.embeddingIndex = { ...index };
+      this.settings.embeddingIndexModel = model;
+      await this.saveSettings();
+    }
+
+    if (plan.toRemove.length > 0 || plan.toEmbed.length === 0) {
+      this.settings.embeddingIndex = { ...index };
+      this.settings.embeddingIndexModel = model;
+      await this.saveSettings();
+    }
+
+    return { embedded, removed: plan.toRemove.length, total: Object.keys(index).length };
+  }
+
+  /** Command wrapper: build/refresh the index, reporting the outcome. */
+  private async runBuildEmbeddingIndex(): Promise<void> {
+    const pending = new Notice('Elias HiveMind: building the embedding index...', 0);
+    try {
+      const stats = await this.buildEmbeddingIndex();
+      new Notice(
+        `Elias HiveMind: embedding index ready — ${stats.total} note${stats.total === 1 ? '' : 's'} indexed ` +
+          `(${stats.embedded} embedded, ${stats.removed} removed) by "${this.settings.embeddingModel.trim()}".`
+      );
+    } catch (error) {
+      console.error('Elias HiveMind embedding index error', error);
+      new Notice(
+        `Elias HiveMind: embedding index failed. ${describeError(error)} ` +
+          'Semantic features need your local server running with an embedding model.',
+        10000
+      );
+    } finally {
+      pending.hide();
+    }
+  }
+
+  /** The configured result count for the semantic surfaces, clamped sane. */
+  private relatedNotesLimit(): number {
+    return Math.max(1, Math.floor(this.settings.relatedNotesCount) || 5);
+  }
+
+  /**
+   * Related notes for the note in the editor: refresh the index, then
+   * rank the vault against the current note's own vector. Read-only for
+   * notes - the only writes are the index refresh in plugin data.
+   */
+  private async runRelatedNotes(editor: Editor, view: MarkdownView): Promise<void> {
+    const file = view.file ?? this.app.workspace.getActiveFile();
+    if (!file) {
+      new Notice('Elias HiveMind: no active note.');
+      return;
+    }
+
+    const pending = new Notice('Elias HiveMind: finding related notes...', 0);
+    try {
+      await this.buildEmbeddingIndex();
+      const entry = (this.settings.embeddingIndex ?? {})[file.path];
+      if (!entry) {
+        new Notice(
+          `Elias HiveMind: "${file.basename}" has no embeddable text, or sits in an ignored folder - nothing to compare.`
+        );
+        return;
+      }
+      const related = rankRelatedNotes(
+        this.settings.embeddingIndex,
+        file.path,
+        entry.vector,
+        this.relatedNotesLimit()
+      );
+      new RelatedNotesModal(this.app, {
+        title: `Related to "${file.basename}"`,
+        intro:
+          `${related.length} note${related.length === 1 ? '' : 's'} closest in meaning, ` +
+          `ranked by your local model "${this.settings.embeddingModel.trim()}". Nothing was written.`,
+        items: related,
+        emptyText:
+          'No other indexed note is similar to this one yet. Similarity is computed ' +
+          'locally from the embedding index - broaden the note, or build the index ' +
+          'again once more of the vault is written.',
+        onOpen: (item) => {
+          this.openRelatedNote(item);
+        },
+      }).open();
+    } catch (error) {
+      console.error('Elias HiveMind related notes error', error);
+      new Notice(
+        `Elias HiveMind: related notes failed. ${describeError(error)} ` +
+          'Semantic features need your local server running with an embedding model.',
+        10000
+      );
+    } finally {
+      pending.hide();
+    }
+  }
+
+  /**
+   * Semantic lookup: refresh the index, then open the lookup modal. The
+   * query itself is embedded only when the user presses Search.
+   */
+  private async runSemanticLookup(): Promise<void> {
+    const pending = new Notice('Elias HiveMind: preparing the embedding index...', 0);
+    try {
+      await this.buildEmbeddingIndex();
+    } catch (error) {
+      console.error('Elias HiveMind semantic lookup error', error);
+      new Notice(
+        `Elias HiveMind: semantic lookup failed. ${describeError(error)} ` +
+          'Semantic features need your local server running with an embedding model.',
+        10000
+      );
+      return;
+    } finally {
+      pending.hide();
+    }
+
+    new SemanticLookupModal(this.app, {
+      intro:
+        'Find notes by meaning, not keywords. Your phrase is embedded by your ' +
+        `local model "${this.settings.embeddingModel.trim()}" and ranked against the index. Nothing leaves this device.`,
+      onSearch: async (query) => {
+        const vectors = await embedTextsViaBackend(this.settings, [
+          embeddingSourceText(query),
+        ]);
+        return rankRelatedNotes(
+          this.settings.embeddingIndex ?? {},
+          '',
+          vectors[0],
+          this.relatedNotesLimit()
+        );
+      },
+      onOpen: (item) => {
+        this.openRelatedNote(item);
+      },
+    }).open();
+  }
+
+  /** Opens a related note in the workspace. Reads and writes no content. */
+  private openRelatedNote(item: RelatedNote): void {
+    const file = this.app.vault.getAbstractFileByPath(item.path);
+    if (!file) {
+      new Notice(`Elias HiveMind: "${item.basename}" no longer exists.`);
+      return;
+    }
+    void this.app.workspace.getLeaf(false).openFile(file as TFile);
+  }
+
   /** Standalone run: refreshes the backlog block in the digest note. */
   private async runBacklogDigest(): Promise<void> {
     const now = new Date();
@@ -3920,6 +4601,49 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
   }
 
   /**
+   * Builds/refreshes the embedding index from the settings tab: the same
+   * public plugin method the command runs, with the outcome reported as a
+   * notice. The index build is the one settings action that talks to the
+   * user's local server - embedding the vault is what the button says.
+   */
+  buildEmbeddingIndexFromSettings(): void {
+    void this.plugin
+      .buildEmbeddingIndex()
+      .then((stats) => {
+        new Notice(
+          `Elias HiveMind: embedding index ready — ${stats.total} note${stats.total === 1 ? '' : 's'} indexed ` +
+            `(${stats.embedded} embedded, ${stats.removed} removed).`
+        );
+      })
+      .catch((error: unknown) => {
+        console.error('Elias HiveMind embedding index error', error);
+        new Notice(
+          `Elias HiveMind: embedding index failed. ${describeError(error)}`,
+          10000
+        );
+      });
+  }
+
+  /** Applies the Build embedding index row's button. */
+  private configureBuildIndexSetting(setting: Setting): void {
+    setting
+      .setName('Build embedding index')
+      .setDesc(
+        'Embed every note with your local server and store the index in this plugin’s data. ' +
+          'Unchanged notes are skipped; the first build of a large vault can take a while.'
+      )
+      .addButton((button) =>
+        button.setButtonText('Build index').onClick(() => {
+          this.buildEmbeddingIndexFromSettings();
+        })
+      );
+  }
+
+  private renderBuildIndexSetting(containerEl: HTMLElement): void {
+    this.configureBuildIndexSetting(new Setting(containerEl));
+  }
+
+  /**
    * Imperative fallback for Obsidian versions older than 1.13.0. On 1.13.0+
    * this is never called - getSettingDefinitions() below renders the tab and
    * feeds the settings search index.
@@ -4057,6 +4781,37 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
     );
 
     this.renderResetPromptsSetting(containerEl);
+
+    new Setting(containerEl).setName('Embeddings').setHeading();
+
+    new Setting(containerEl)
+      .setName('Embedding model')
+      .setDesc('Model your local server uses for Related notes and Semantic lookup. An embedding model (e.g. nomic-embed-text), not a chat model. Changing it rebuilds the index.')
+      .addText((text) =>
+        text
+          .setPlaceholder('nomic-embed-text')
+          .setValue(this.plugin.settings.embeddingModel)
+          .onChange((value) => {
+            this.plugin.settings.embeddingModel = value.trim();
+            void this.plugin.saveSettings();
+          })
+      );
+
+    new Setting(containerEl)
+      .setName('Related notes shown')
+      .setDesc('How many notes Related notes and Semantic lookup list at once.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 10, 1)
+          .setValue(this.plugin.settings.relatedNotesCount)
+          .setDynamicTooltip()
+          .onChange((value) => {
+            this.plugin.settings.relatedNotesCount = value;
+            void this.plugin.saveSettings();
+          })
+      );
+
+    this.renderBuildIndexSetting(containerEl);
 
     new Setting(containerEl).setName('Tags').setHeading();
 
@@ -4252,6 +5007,10 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
         settings[key] = String(value).trim();
         break;
 
+      case 'embeddingModel':
+        settings[key] = String(value).trim();
+        break;
+
       case 'backendTimeoutMs': {
         const parsed = Number.parseInt(String(value), 10);
         settings[key] =
@@ -4426,6 +5185,43 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
             name: 'Reset prompts',
             render: (setting) => {
               this.configureResetPromptsSetting(setting);
+            },
+          },
+        ],
+      },
+      {
+        type: 'group',
+        heading: 'Embeddings',
+        items: [
+          {
+            name: 'Embedding model',
+            desc: 'Model your local server uses for Related notes and Semantic lookup. An embedding model (e.g. nomic-embed-text), not a chat model. Changing it rebuilds the index.',
+            control: {
+              type: 'text',
+              key: 'embeddingModel',
+              placeholder: 'nomic-embed-text',
+              defaultValue: DEFAULT_SETTINGS.embeddingModel,
+            },
+          },
+          {
+            name: 'Related notes shown',
+            desc: 'How many notes Related notes and Semantic lookup list at once.',
+            control: {
+              type: 'slider',
+              key: 'relatedNotesCount',
+              min: 1,
+              max: 10,
+              step: 1,
+              defaultValue: DEFAULT_SETTINGS.relatedNotesCount,
+            },
+          },
+          {
+            // No button control exists in the declarative vocabulary, so
+            // the build action stays imperative via render - the Reset
+            // prompts precedent - identical in both settings paths.
+            name: 'Build embedding index',
+            render: (setting) => {
+              this.configureBuildIndexSetting(setting);
             },
           },
         ],

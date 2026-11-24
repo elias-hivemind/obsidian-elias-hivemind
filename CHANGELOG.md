@@ -3,6 +3,61 @@
 All notable changes to Elias HiveMind. Versions match `manifest.json`; each
 release is cut from the tag of the same name (no `v` prefix).
 
+## 1.7.0
+
+- **Local embeddings: related notes and semantic lookup.** Three new
+  commands compute note vectors with an embedding model on the same
+  local server as the other backend features - no new server to
+  configure, because the embedding endpoint is derived from the backend
+  already set up (Ollama `/api/embed`, or `/v1/embeddings` on
+  OpenAI-compatible servers: LM Studio, llama.cpp, Jan). The vectors
+  are stored only in the plugin's own `data.json`, on this device, and
+  no embedding request is ever made in the background.
+- **Build embedding index (local server)** embeds every note with
+  text - the digest note, the configuration folder and ignored folders
+  excluded, the same candidate shape as Resurface - keyed by a hash of
+  the exact text embedded. Rebuilds are incremental: unchanged notes
+  cost no requests, changed notes re-embed, deleted or emptied notes
+  drop out, and changing the embedding model rebuilds everything,
+  because vectors from different models are not comparable. A build
+  saves after every batch of 16, so a server dying mid-build keeps the
+  batches that landed; a response whose vector count or dimensions do
+  not match the request fails the build instead of writing a corrupt
+  index.
+- **Related notes for current note (semantic)** ranks the rest of the
+  vault against the open note by cosine similarity and shows the top
+  matches in a review modal, each with its similarity as a percentage
+  and an **Open** button. Zero or negative similarity is never shown:
+  an unrelated note is not a result.
+- **Semantic lookup: find notes by meaning** embeds a phrase you type
+  and ranks the whole vault against it, in the same modal. Opening the
+  modal makes no request; the search runs when you click **Search**.
+- **Settings** gain an **Embeddings** group between Prompts and Tags:
+  **Embedding model** (default `nomic-embed-text`), **Related notes
+  shown** (1-10, default 5) and a **Build index** button that runs the
+  same build and reports its counts.
+- **Commands and modals, not a sidebar pane.** The roadmap said
+  "sidebar pane"; the plugin has no view infrastructure at all, and
+  every discovery feature it has - Resurface above all - is a command
+  plus a modal, so that is the shape this ships in. Same ranking, same
+  honesty, no new surface to learn.
+- **Honest costs, stated in the README:** a first index of a
+  ~5,000-note vault takes tens of minutes on a local server, and
+  embedding is heavy on mobile - build on desktop and let the index
+  sync. With no local server running, the three commands fail plainly
+  and change nothing; everything else works exactly as before, fully
+  offline.
+- **Verification:** test suite 339 checks, all passing (302 at 1.6.0;
+  +37, including hand-computed cosine rankings against a deterministic
+  fake embedding server, the incremental-index rules, and both
+  endpoint shapes). Two existing expectations changed, both for the
+  new feature and both marked in the suite: the registered-command
+  list gains the three embedding commands, and the settings-definition
+  groups go from seven to eight with two new control keys. Typecheck
+  (`tsc --noEmit`) clean. The built `dist/main.js` is byte-identical
+  when the patch is applied to a pristine checkout of the previous
+  release and rebuilt (reproduce-from-patch).
+
 ## 1.6.0
 
 - **One-click backend presets.** The Backend settings now open with a

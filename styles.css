@@ -63,3 +63,9 @@
 .ehm-resurface-why {
   color: var(--text-muted);
 }
+
+/* The semantic lookup query field: full width of the modal. */
+.ehm-lookup-input {
+  width: 100%;
+  margin: 0.5em 0;
+}
