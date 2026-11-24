@@ -187,6 +187,14 @@ declare module 'obsidian' {
     onChange(callback: (value: string) => void): this;
   }
 
+  export class TextAreaComponent {
+    inputEl: HTMLTextAreaElement;
+    getValue(): string;
+    setValue(value: string): this;
+    setPlaceholder(placeholder: string): this;
+    onChange(callback: (value: string) => void): this;
+  }
+
   export class ToggleComponent {
     getValue(): boolean;
     setValue(value: boolean): this;
@@ -215,6 +223,7 @@ declare module 'obsidian' {
     setDesc(desc: string): this;
     setHeading(): this;
     addText(cb: (component: TextComponent) => void): this;
+    addTextArea(cb: (component: TextAreaComponent) => void): this;
     addToggle(cb: (component: ToggleComponent) => void): this;
     addDropdown(cb: (component: DropdownComponent) => void): this;
     addSlider(cb: (component: SliderComponent) => void): this;

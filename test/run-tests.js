@@ -134,6 +134,8 @@ function component(extra) {
 }
 
 const DROPDOWNS = [];
+const TEXTAREAS = [];
+const BUTTONS = [];
 
 class Setting {
   constructor(containerEl) { this.settingEl = containerEl; }
@@ -143,13 +145,43 @@ class Setting {
   addText(cb) { cb(component()); return this; }
   addToggle(cb) { cb(component()); return this; }
   addDropdown(cb) {
-    const dropdown = component({ options: [], addOption(value, display) { this.options.push([value, display]); return this; } });
+    const dropdown = component({
+      options: [],
+      _value: '',
+      _onChange: null,
+      addOption(value, display) { this.options.push([value, display]); return this; },
+      setValue(v) { this._value = v; return this; },
+      getValue() { return this._value; },
+      onChange(fn) { this._onChange = fn; return this; },
+    });
     DROPDOWNS.push(dropdown);
     cb(dropdown);
     return this;
   }
   addSlider(cb) { cb(component()); return this; }
-  addButton(cb) { cb(component()); return this; }
+  addButton(cb) {
+    const button = component({
+      _text: '',
+      _onClick: null,
+      setButtonText(t) { this._text = t; return this; },
+      onClick(fn) { this._onClick = fn; return this; },
+    });
+    BUTTONS.push(button);
+    cb(button);
+    return this;
+  }
+  addTextArea(cb) {
+    const area = component({
+      _value: '',
+      _onChange: null,
+      setValue(v) { this._value = v; return this; },
+      getValue() { return this._value; },
+      onChange(fn) { this._onChange = fn; return this; },
+    });
+    TEXTAREAS.push(area);
+    cb(area);
+    return this;
+  }
 }
 
 class Plugin {
@@ -601,8 +633,10 @@ async function main() {
   console.log('\n[10f] declarative settings definitions (Obsidian 1.13.0+)');
   const defs = tab.getSettingDefinitions();
   const groups = defs.map((d) => d.heading);
-  check('six groups, in display() order',
-    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Tags', 'Link suggestion', 'Backlog', 'Resurface']),
+  // v1.6.0: a seventh group, Prompts, joins between Backend and Tags
+  // (expected value changed for the new group - documented in the build report).
+  check('seven groups, in display() order',
+    JSON.stringify(groups) === JSON.stringify(['Summarization', 'Backend', 'Prompts', 'Tags', 'Link suggestion', 'Backlog', 'Resurface']),
     JSON.stringify(groups));
 
   const allItems = defs.flatMap((g) => g.items || []);
@@ -614,7 +648,10 @@ async function main() {
     'minTitleLength', 'resurfaceColdDays', 'resurfaceInDigest', 'resurfaceQueueSize',
     'summaryHeading', 'summarySentenceCount',
   ];
-  check('every persisted setting except backendModel has a control',
+  // v1.6.0: backendModel, backendPrompt and tagPrompt are render rows, not
+  // controls (no textarea exists in the declarative control vocabulary), so
+  // the control-key list is unchanged; the render rows are checked in [10g].
+  check('every control-backed setting has a control (model + prompts are render rows)',
     JSON.stringify(controlKeys) === JSON.stringify(expectedKeys), JSON.stringify(controlKeys));
   check('every control key exists on the settings object',
     controlKeys.every((k) => k in plugin.settings),
@@ -640,6 +677,136 @@ async function main() {
   const timeoutDef = allItems.find((i) => i.control && i.control.key === 'backendTimeoutMs');
   check('timeout validate() rejects zero', typeof timeoutDef.control.validate(0) === 'string');
   check('timeout validate() accepts a positive number', timeoutDef.control.validate(1000) === undefined);
+
+  console.log('\n[10g] backend presets + prompt controls (v1.6.0)');
+  const DEFAULT_BACKEND_PROMPT =
+    'Summarise the following note in {{n}} concise sentences. ' +
+    'Return only the summary, with no preamble.\n\n{{content}}';
+  const DEFAULT_TAG_PROMPT =
+    'Suggest up to {{n}} short topic tags for the following note. ' +
+    'Return only a comma-separated list of lowercase tags, with no preamble.\n\n{{content}}';
+  check('plugin settings start from the exact default prompt strings',
+    plugin.settings.backendPrompt === DEFAULT_BACKEND_PROMPT &&
+    plugin.settings.tagPrompt === DEFAULT_TAG_PROMPT,
+    plugin.settings.backendPrompt + ' / ' + plugin.settings.tagPrompt);
+
+  // Declarative path: preset + prompt rows are render items (no textarea or
+  // button control exists in the declarative vocabulary - Model precedent).
+  check('declarative: Backend preset is a render row in the Backend group',
+    (() => { const g = defs.find((d) => d.heading === 'Backend'); const i = g && g.items.find((x) => x.name === 'Backend preset'); return Boolean(i && typeof i.render === 'function' && !i.control); })());
+  const promptsGroup = defs.find((d) => d.heading === 'Prompts');
+  check('declarative: Prompts group carries Summary prompt, Tag prompt and Reset prompts render rows',
+    Boolean(promptsGroup) && ['Summary prompt', 'Tag prompt', 'Reset prompts'].every((n) =>
+      promptsGroup.items.some((i) => i.name === n && typeof i.render === 'function' && !i.control)),
+    promptsGroup && JSON.stringify(promptsGroup.items.map((i) => i.name)));
+
+  // Preset table correctness + "changes only url/format", driven through the
+  // same tab action both settings paths call. REQUEST_HANDLER is armed to
+  // fail here, so any model-list refresh fails gracefully offline.
+  const PRESET_TABLE = [
+    ['ollama', 'http://127.0.0.1:11434/api/generate', 'ollama'],
+    ['lmstudio', 'http://127.0.0.1:1234/v1/chat/completions', 'openai'],
+    ['llamacpp', 'http://127.0.0.1:8080/v1/chat/completions', 'openai'],
+    ['jan', 'http://127.0.0.1:1337/v1/chat/completions', 'openai'],
+  ];
+  for (const [id, url, format] of PRESET_TABLE) {
+    const before = JSON.stringify({ ...plugin.settings, backendUrl: null, backendFormat: null });
+    check('preset applies: ' + id, tab.applyBackendPreset(id) === true);
+    await flush();
+    check('preset ' + id + ' fills the exact URL + format',
+      plugin.settings.backendUrl === url && plugin.settings.backendFormat === format,
+      plugin.settings.backendUrl + ' / ' + plugin.settings.backendFormat);
+    check('preset ' + id + ' changes nothing except backendUrl/backendFormat',
+      JSON.stringify({ ...plugin.settings, backendUrl: null, backendFormat: null }) === before);
+  }
+  check('unknown preset id is rejected', tab.applyBackendPreset('not-a-server') === false);
+  check('unknown preset changed nothing',
+    plugin.settings.backendUrl === 'http://127.0.0.1:1337/v1/chat/completions' &&
+    plugin.settings.backendFormat === 'openai', plugin.settings.backendUrl);
+
+  // Model-list derivation handles every preset URL shape.
+  const MODEL_URLS = [];
+  REQUEST_HANDLER = async (param) => {
+    MODEL_URLS.push(param.url);
+    return param.url.includes('/api/tags')
+      ? { status: 200, headers: {}, text: '', json: { models: [{ name: 'm1' }] } }
+      : { status: 200, headers: {}, text: '', json: { data: [{ id: 'm1' }] } };
+  };
+  const EXPECTED_MODEL_URLS = [
+    'http://127.0.0.1:11434/api/tags',
+    'http://127.0.0.1:1234/v1/models',
+    'http://127.0.0.1:8080/v1/models',
+    'http://127.0.0.1:1337/v1/models',
+  ];
+  for (let i = 0; i < PRESET_TABLE.length; i += 1) {
+    plugin.settings.backendUrl = PRESET_TABLE[i][1];
+    plugin.settings.backendFormat = PRESET_TABLE[i][2];
+    const names = await plugin.fetchAvailableModels();
+    check('model list derives + parses for preset ' + PRESET_TABLE[i][0],
+      MODEL_URLS[MODEL_URLS.length - 1] === EXPECTED_MODEL_URLS[i] && names.join(',') === 'm1',
+      MODEL_URLS[MODEL_URLS.length - 1] + ' / ' + names.join(','));
+  }
+  REQUEST_HANDLER = async () => { throw new Error('connect ECONNREFUSED'); };
+
+  // Imperative path: a fresh display() renders the preset dropdown, both
+  // prompt textareas (holding the current values) and the reset button.
+  DROPDOWNS.length = 0; TEXTAREAS.length = 0; BUTTONS.length = 0;
+  tab.modelState = 'idle';
+  let presetDisplayErr = null;
+  try { tab.display(); await flush(); } catch (e) { presetDisplayErr = e; }
+  check('display() with presets + prompt controls ran clean', presetDisplayErr === null, presetDisplayErr && presetDisplayErr.message);
+  const presetDropdown = DROPDOWNS.find((d) => d.options.some(([v]) => v === 'lmstudio'));
+  check('preset dropdown offers all four local servers',
+    Boolean(presetDropdown) && ['ollama', 'lmstudio', 'llamacpp', 'jan'].every((id) => presetDropdown.options.some(([v]) => v === id)),
+    JSON.stringify(DROPDOWNS.map((d) => d.options)));
+  check('preset dropdown reflects the currently matching preset (jan)',
+    Boolean(presetDropdown) && presetDropdown.getValue() === 'jan',
+    presetDropdown && String(presetDropdown.getValue()));
+  // The model-list load re-renders the tab once (existing refresh path), so
+  // the pair renders twice; every rendered textarea must hold a prompt value.
+  check('prompt textareas render, holding the current prompt values',
+    TEXTAREAS.length >= 2 && TEXTAREAS.some((a) => a.getValue() === plugin.settings.backendPrompt) &&
+    TEXTAREAS.some((a) => a.getValue() === plugin.settings.tagPrompt) &&
+    TEXTAREAS.every((a) => a.getValue() === plugin.settings.backendPrompt || a.getValue() === plugin.settings.tagPrompt),
+    'textareas: ' + TEXTAREAS.length);
+  check('reset-prompts button renders', BUTTONS.some((b) => b._text === 'Reset to defaults'));
+
+  // Selecting a preset in the dropdown applies it (one click, settings only).
+  if (presetDropdown && presetDropdown._onChange) presetDropdown._onChange('lmstudio');
+  await flush();
+  check('preset dropdown selection applies LM Studio url/format',
+    plugin.settings.backendUrl === 'http://127.0.0.1:1234/v1/chat/completions' &&
+    plugin.settings.backendFormat === 'openai', plugin.settings.backendUrl);
+
+  // Editing a prompt textarea changes only that prompt field.
+  const summaryArea = TEXTAREAS.find((a) => a.getValue() === plugin.settings.backendPrompt);
+  const otherBefore = plugin.settings.tagPrompt;
+  if (summaryArea && summaryArea._onChange) summaryArea._onChange('Custom summary prompt {{n}} {{content}}');
+  check('summary prompt textarea edits backendPrompt only',
+    plugin.settings.backendPrompt === 'Custom summary prompt {{n}} {{content}}' &&
+    plugin.settings.tagPrompt === otherBefore, plugin.settings.backendPrompt);
+  tab.setControlValue('tagPrompt', 'Custom tag prompt {{n}} {{content}}');
+  check('setControlValue writes tagPrompt through to settings',
+    plugin.settings.tagPrompt === 'Custom tag prompt {{n}} {{content}}', plugin.settings.tagPrompt);
+  check('getControlValue reads backendPrompt through to settings',
+    tab.getControlValue('backendPrompt') === plugin.settings.backendPrompt);
+
+  // Reset restores the exact shipped defaults for both prompts - via the
+  // tab action, and via the rendered button.
+  tab.resetPromptsToDefaults();
+  check('reset restores the exact default summary prompt', plugin.settings.backendPrompt === DEFAULT_BACKEND_PROMPT, plugin.settings.backendPrompt);
+  check('reset restores the exact default tag prompt', plugin.settings.tagPrompt === DEFAULT_TAG_PROMPT, plugin.settings.tagPrompt);
+  plugin.settings.backendPrompt = 'dirty'; plugin.settings.tagPrompt = 'dirty';
+  const resetButton = BUTTONS.find((b) => b._text === 'Reset to defaults');
+  if (resetButton && resetButton._onClick) resetButton._onClick({});
+  check('rendered Reset to defaults button restores both prompts',
+    plugin.settings.backendPrompt === DEFAULT_BACKEND_PROMPT && plugin.settings.tagPrompt === DEFAULT_TAG_PROMPT,
+    plugin.settings.backendPrompt + ' / ' + plugin.settings.tagPrompt);
+
+  // Leave the tab's settings in the default backend state for later sections.
+  plugin.settings.backendUrl = 'http://127.0.0.1:11434/api/generate';
+  plugin.settings.backendFormat = 'ollama';
+  tab.modelState = 'idle';
 
   console.log('\n[11] settings persistence round-trip');
   plugin.settings.summarySentenceCount = 7;

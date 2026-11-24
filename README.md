@@ -11,7 +11,7 @@ New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language st
 Download: [HiveMind-OS-Vault-v1.zip](https://github.com/elias-hivemind/obsidian-elias-hivemind/releases/download/1.5.0/HiveMind-OS-Vault-v1.zip) (attached to the 1.5.0 release)
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.5.0
+- **Version:** 1.6.0
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -259,6 +259,19 @@ Open the command palette and run **Elias HiveMind Plugin: Test backend connectio
 
 In this mode the model list is read from `/v1/models` on the same server. The plugin sends no API key or authorization header, so it is meant for local servers that don't require one.
 
+### Backend presets
+
+The **Backend preset** dropdown at the top of the Backend settings fills in the Backend URL and Request format in one click, so you don't have to look up a server's port or endpoint path:
+
+| Preset | Backend URL filled in | Request format |
+|---|---|---|
+| Ollama | `http://127.0.0.1:11434/api/generate` | Ollama |
+| LM Studio | `http://127.0.0.1:1234/v1/chat/completions` | OpenAI-compatible |
+| llama.cpp server | `http://127.0.0.1:8080/v1/chat/completions` | OpenAI-compatible |
+| Jan | `http://127.0.0.1:1337/v1/chat/completions` | OpenAI-compatible |
+
+All four are servers you run on your own machine. Applying a preset changes only those two settings and makes no connection by itself — the model list then refreshes for the new endpoint, as it does when you change the Request format by hand. If your server runs on a different port or path, pick the closest preset and edit the Backend URL afterwards, or just type the URL directly; presets are a shortcut, not a restriction.
+
 ---
 
 ## Offline fallback
@@ -323,6 +336,7 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 
 | Setting | Default | Description |
 |---|---|---|
+| Backend preset | *(none)* | One-click fill of Backend URL + Request format for Ollama, LM Studio, llama.cpp server or Jan — all local servers. Shows the matching preset when the current URL and format match one exactly. |
 | Backend URL | `http://127.0.0.1:11434/api/generate` | Full endpoint URL that note text is sent to. |
 | Request format | Ollama | *Ollama* sends `{ model, prompt }`. *OpenAI-compatible* sends `{ model, messages[] }`. |
 | Model | `llama3.2` | A dropdown of the models installed on the backend, with a **Refresh** button. Shows a text field instead if the list can't be loaded. |
@@ -363,14 +377,14 @@ All commands appear in the command palette prefixed with **Elias HiveMind:**.
 
 Snooze records and the never-show list are stored in the plugin's own `data.json`, like the backlog's progress baseline; they have no settings-tab control and never touch a note.
 
-### Prompts (no settings-tab control)
+### Prompts
 
-The prompts sent to the model are stored in the plugin's `data.json` (in the plugin folder) and can be edited there while Obsidian is closed. Both support two placeholders: `{{n}}` (summary length or maximum tags) and `{{content}}` (the note's plain text).
+The prompts sent to the model are editable in the settings tab, in the **Prompts** group: **Summary prompt** and **Tag prompt** are text areas, and **Reset to defaults** restores both to the shipped values below. (They are still stored in the plugin's `data.json`, as before — the settings tab is now the supported way to edit them.) Both support two placeholders: `{{n}}` (summary length or maximum tags) and `{{content}}` (the note's plain text).
 
-| Key | Default |
+| Setting | Default |
 |---|---|
-| `backendPrompt` | `Summarise the following note in {{n}} concise sentences. Return only the summary, with no preamble.` followed by the content |
-| `tagPrompt` | `Suggest up to {{n}} short topic tags for the following note. Return only a comma-separated list of lowercase tags, with no preamble.` followed by the content |
+| Summary prompt (`backendPrompt`) | `Summarise the following note in {{n}} concise sentences. Return only the summary, with no preamble.` followed by the content |
+| Tag prompt (`tagPrompt`) | `Suggest up to {{n}} short topic tags for the following note. Return only a comma-separated list of lowercase tags, with no preamble.` followed by the content |
 
 Tag replies are split on commas and new lines. Leading list markers (`-`, `*`, `1.`) are removed before each tag is normalised.
 

@@ -3,6 +3,31 @@
 All notable changes to Elias HiveMind. Versions match `manifest.json`; each
 release is cut from the tag of the same name (no `v` prefix).
 
+## 1.6.0
+
+- **One-click backend presets.** The Backend settings now open with a
+  **Backend preset** dropdown: pick Ollama, LM Studio, llama.cpp server
+  or Jan and the **Backend URL** and **Request format** are filled in for
+  you - Ollama at `http://127.0.0.1:11434/api/generate` (Ollama format),
+  LM Studio at `http://127.0.0.1:1234/v1/chat/completions`, llama.cpp
+  server at `http://127.0.0.1:8080/v1/chat/completions` and Jan at
+  `http://127.0.0.1:1337/v1/chat/completions` (all three
+  OpenAI-compatible). All four are servers you run on your own machine:
+  no cloud endpoint, no API key, and applying a preset makes no
+  connection - it only fills in the two fields (the model list then
+  refreshes for the new endpoint, as it already does when the format
+  changes). The preset row shows the matching preset when the current
+  URL and format match one exactly. Hand-typed URLs keep working exactly
+  as before, including the model-list derivation (`/api/tags` for
+  Ollama, `/v1/models` for OpenAI-compatible servers).
+- **The prompts are editable in Settings.** The summary and tag prompt
+  templates (`backendPrompt` / `tagPrompt`), previously editable only by
+  hand-editing `data.json` with Obsidian closed, now have text areas in
+  a new **Prompts** settings group, in both settings interfaces, plus a
+  **Reset to defaults** button that restores both templates to their
+  shipped values. Editing a prompt changes only that field; the
+  `{{n}}` and `{{content}}` placeholders work as before.
+
 ## 1.5.0
 
 - **Link suggestions now link in place.** **Suggest links for current

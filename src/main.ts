@@ -164,6 +164,89 @@ const DEFAULT_SETTINGS: EliasHiveMindSettings = {
 };
 
 /* ========================================================================== */
+/*                             backend presets                                */
+/* ========================================================================== */
+
+/**
+ * One-click backend presets. Every preset is a server the user runs on
+ * their own machine - local only, no cloud endpoint, no API key, no
+ * telemetry. Applying a preset only fills in `backendUrl` and
+ * `backendFormat`; it makes no network call.
+ *
+ * URL convention (matches how the values are consumed): `backendUrl` is
+ * the full generation endpoint, not a server root. `generateViaBackend`
+ * POSTs to it verbatim, and `modelListUrl` derives the model list from
+ * it - `/api/tags` at the origin for Ollama, `<prefix>/v1/models` for
+ * OpenAI-compatible servers - so each preset URL below already carries
+ * the path its server expects.
+ */
+interface BackendPreset {
+  id: string;
+  name: string;
+  backendUrl: string;
+  backendFormat: BackendFormat;
+}
+
+const BACKEND_PRESETS: readonly BackendPreset[] = [
+  {
+    id: 'ollama',
+    name: 'Ollama',
+    backendUrl: 'http://127.0.0.1:11434/api/generate',
+    backendFormat: 'ollama',
+  },
+  {
+    id: 'lmstudio',
+    name: 'LM Studio',
+    backendUrl: 'http://127.0.0.1:1234/v1/chat/completions',
+    backendFormat: 'openai',
+  },
+  {
+    id: 'llamacpp',
+    name: 'llama.cpp server',
+    backendUrl: 'http://127.0.0.1:8080/v1/chat/completions',
+    backendFormat: 'openai',
+  },
+  {
+    id: 'jan',
+    name: 'Jan',
+    backendUrl: 'http://127.0.0.1:1337/v1/chat/completions',
+    backendFormat: 'openai',
+  },
+];
+
+/** Looks a preset up by id; returns undefined for an unknown id. */
+function findBackendPreset(id: string): BackendPreset | undefined {
+  return BACKEND_PRESETS.find((preset) => preset.id === id);
+}
+
+/**
+ * Fills `backendUrl` + `backendFormat` from a preset - and nothing else.
+ * Returns false (and changes nothing) for an unknown preset id.
+ */
+function applyBackendPreset(settings: EliasHiveMindSettings, presetId: string): boolean {
+  const preset = findBackendPreset(presetId);
+  if (!preset) return false;
+  settings.backendUrl = preset.backendUrl;
+  settings.backendFormat = preset.backendFormat;
+  return true;
+}
+
+/** The id of the preset the current URL + format exactly match, or ''. */
+function backendPresetIdFor(settings: EliasHiveMindSettings): string {
+  const match = BACKEND_PRESETS.find(
+    (preset) =>
+      preset.backendUrl === settings.backendUrl && preset.backendFormat === settings.backendFormat
+  );
+  return match ? match.id : '';
+}
+
+/** Restores both prompt templates to their DEFAULT_SETTINGS values - and nothing else. */
+function resetPromptsToDefaults(settings: EliasHiveMindSettings): void {
+  settings.backendPrompt = DEFAULT_SETTINGS.backendPrompt;
+  settings.tagPrompt = DEFAULT_SETTINGS.tagPrompt;
+}
+
+/* ========================================================================== */
 /*                             markdown utilities                             */
 /* ========================================================================== */
 
@@ -3746,6 +3829,97 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
   }
 
   /**
+   * Applies a backend preset to the plugin settings: fills the URL and
+   * request format only, saves, and refreshes the model list and the tab
+   * (the URL/format rows show the preset's values). No network call is
+   * made by applying a preset itself; the model-list refresh that follows
+   * is the same one the Request format control already triggers.
+   * Returns false for an unknown preset id, changing nothing.
+   */
+  applyBackendPreset(presetId: string): boolean {
+    if (!applyBackendPreset(this.plugin.settings, presetId)) return false;
+    // The model list belongs to the old endpoint; refetch for the new one.
+    this.modelState = 'idle';
+    void this.plugin.saveSettings();
+    this.loadModels();
+    this.refresh();
+    return true;
+  }
+
+  /** Restores both prompt templates to their defaults, saves and re-renders. */
+  resetPromptsToDefaults(): void {
+    resetPromptsToDefaults(this.plugin.settings);
+    void this.plugin.saveSettings();
+    this.refresh();
+  }
+
+  /** Applies the Backend preset row's description and one-click dropdown. */
+  private configurePresetSetting(setting: Setting): void {
+    setting
+      .setName('Backend preset')
+      .setDesc(
+        'Fill in the Backend URL and Request format for a local server you run yourself. ' +
+          'Applies on selection and makes no connection by itself.'
+      )
+      .addDropdown((dropdown) => {
+        dropdown.addOption('', 'Choose a local server...');
+        for (const preset of BACKEND_PRESETS) dropdown.addOption(preset.id, preset.name);
+        dropdown.setValue(backendPresetIdFor(this.plugin.settings)).onChange((value) => {
+          if (value) this.applyBackendPreset(value);
+        });
+      });
+  }
+
+  private renderPresetSetting(containerEl: HTMLElement): void {
+    this.configurePresetSetting(new Setting(containerEl));
+  }
+
+  /** Applies one prompt row's textarea, bound to a single prompt field. */
+  private configurePromptSetting(
+    setting: Setting,
+    key: 'backendPrompt' | 'tagPrompt',
+    name: string,
+    desc: string
+  ): void {
+    setting
+      .setName(name)
+      .setDesc(desc)
+      .addTextArea((text) =>
+        text.setValue(this.plugin.settings[key]).onChange((value) => {
+          // Verbatim, like the other free-text controls: prompts are the
+          // user's words, so no trimming or coercion is applied.
+          this.plugin.settings[key] = value;
+          void this.plugin.saveSettings();
+        })
+      );
+  }
+
+  private renderPromptSetting(
+    containerEl: HTMLElement,
+    key: 'backendPrompt' | 'tagPrompt',
+    name: string,
+    desc: string
+  ): void {
+    this.configurePromptSetting(new Setting(containerEl), key, name, desc);
+  }
+
+  /** Applies the Reset prompts row's button. */
+  private configureResetPromptsSetting(setting: Setting): void {
+    setting
+      .setName('Reset prompts')
+      .setDesc('Restore both prompt templates to their defaults.')
+      .addButton((button) =>
+        button.setButtonText('Reset to defaults').onClick(() => {
+          this.resetPromptsToDefaults();
+        })
+      );
+  }
+
+  private renderResetPromptsSetting(containerEl: HTMLElement): void {
+    this.configureResetPromptsSetting(new Setting(containerEl));
+  }
+
+  /**
    * Imperative fallback for Obsidian versions older than 1.13.0. On 1.13.0+
    * this is never called - getSettingDefinitions() below renders the tab and
    * feeds the settings search index.
@@ -3800,6 +3974,8 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl).setName('Backend').setHeading();
+
+    this.renderPresetSetting(containerEl);
 
     new Setting(containerEl)
       .setName('Backend URL')
@@ -3863,6 +4039,24 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
             void this.plugin.saveSettings();
           })
       );
+
+    new Setting(containerEl).setName('Prompts').setHeading();
+
+    this.renderPromptSetting(
+      containerEl,
+      'backendPrompt',
+      'Summary prompt',
+      'Template sent to the backend when summarising. {{n}} is the summary length, {{content}} the note text.'
+    );
+
+    this.renderPromptSetting(
+      containerEl,
+      'tagPrompt',
+      'Tag prompt',
+      'Template sent to the backend when suggesting tags. {{n}} is the maximum number of tags, {{content}} the note text.'
+    );
+
+    this.renderResetPromptsSetting(containerEl);
 
     new Setting(containerEl).setName('Tags').setHeading();
 
@@ -4128,6 +4322,16 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
         heading: 'Backend',
         items: [
           {
+            // The declarative control vocabulary has no "apply a preset"
+            // control, so the preset dropdown stays imperative, like the
+            // Model row below: same control, same behaviour, both paths.
+            name: 'Backend preset',
+            aliases: ['ollama', 'lm studio', 'llama.cpp', 'jan'],
+            render: (setting) => {
+              this.configurePresetSetting(setting);
+            },
+          },
+          {
             name: 'Backend URL',
             desc:
               'Full endpoint URL. Defaults to a local Ollama server, so note content stays on this machine. ' +
@@ -4181,6 +4385,47 @@ class EliasHiveMindSettingTab extends PluginSettingTab {
                 Number.isFinite(value) && value > 0
                   ? undefined
                   : 'Enter a positive whole number of milliseconds.',
+            },
+          },
+        ],
+      },
+      {
+        type: 'group',
+        heading: 'Prompts',
+        items: [
+          {
+            // No textarea control exists in the declarative vocabulary
+            // (toggle/text/dropdown/number/slider only), so the prompt
+            // rows stay imperative via render - the Model-row precedent -
+            // giving both settings paths the identical textarea.
+            name: 'Summary prompt',
+            aliases: ['backendPrompt', 'prompt'],
+            render: (setting) => {
+              this.configurePromptSetting(
+                setting,
+                'backendPrompt',
+                'Summary prompt',
+                'Template sent to the backend when summarising. {{n}} is the summary length, {{content}} the note text.'
+              );
+            },
+          },
+          {
+            name: 'Tag prompt',
+            aliases: ['tagPrompt', 'prompt'],
+            render: (setting) => {
+              this.configurePromptSetting(
+                setting,
+                'tagPrompt',
+                'Tag prompt',
+                'Template sent to the backend when suggesting tags. {{n}} is the maximum number of tags, {{content}} the note text.'
+              );
+            },
+          },
+          {
+            // No button control exists declaratively either; render again.
+            name: 'Reset prompts',
+            render: (setting) => {
+              this.configureResetPromptsSetting(setting);
             },
           },
         ],
