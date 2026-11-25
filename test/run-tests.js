@@ -2468,6 +2468,135 @@ async function main() {
     REQUEST_HANDLER = null;
   }
 
+  console.log('\n[28] non-English notes (v1.8.0): Unicode tokenization, multilingual stopwords, CJK bigrams');
+  {
+    // Drive everything through the public commands, like every other
+    // section. Pin the summary settings this section depends on (earlier
+    // sections mutate them) and restore them at the end.
+    const savedSentenceCount = plugin.settings.summarySentenceCount;
+    const savedHeading = plugin.settings.summaryHeading;
+    const savedInsertMode = plugin.settings.insertMode;
+    plugin.settings.summarySentenceCount = 2;
+    plugin.settings.summaryHeading = '## Summary';
+    plugin.settings.insertMode = 'top';
+    const uniLocalCmd = plugin._commands.find((c) => c.id === 'summarize-note-local');
+    const uniTagCmd = plugin._commands.find((c) => c.id === 'generate-tags-local');
+    const uniTagBackendCmd = plugin._commands.find((c) => c.id === 'generate-tags-backend');
+
+    const summarise = async (text) => {
+      const ed = new MockEditor(text);
+      NOTICES.length = 0;
+      uniLocalCmd.editorCallback(ed, { file: activeFile });
+      await flush();
+      return ed.text.split('\n')[1] || '';
+    };
+    const localTags = async (text) => {
+      const ed = new MockEditor(text);
+      MODALS.length = 0;
+      await uniTagCmd.editorCallback(ed, { file: activeFile });
+      await flush();
+      const modal = confirmLatestModal('Add selected tags');
+      const boxes = modal.nodes.filter((n) => n.tagName === 'INPUT' && n.type === 'checkbox');
+      return { head: ed.text.split('\n---\n')[0], text: ed.text, boxes: boxes.length };
+    };
+
+    // Spanish summary: accented words stay whole, Spanish stopwords
+    // (el, las, del, en, de) carry no score, the two garden sentences win.
+    const esSummary = await summarise([
+      'El jardín necesita agua durante el verano.',
+      'Las plantas del jardín crecen con agua y sol.',
+      'El agua del río riega las plantas del jardín.',
+      'María compra libros en la librería del barrio.',
+      'Los libros de historia ocupan un estante completo.',
+      'El jardín recibe agua cada mañana de verano.',
+    ].join(' '));
+    check('Spanish summary is non-empty', esSummary.trim().length > 20, esSummary);
+    check('Spanish summary picks the top garden sentence',
+      esSummary.includes('El jardín necesita agua durante el verano.'), esSummary);
+    check('Spanish summary picks the second garden sentence',
+      esSummary.includes('Las plantas del jardín crecen con agua y sol.'), esSummary);
+    check('Spanish summary keeps accented words intact',
+      esSummary.includes('jardín') && !esSummary.includes('jardí n'), esSummary);
+    check('Spanish summary drops the off-topic sentences',
+      !esSummary.includes('María compra') && !esSummary.includes('estante completo'), esSummary);
+
+    // French tags: café (accented) is the top tag, étudiants survives
+    // whole, and the repeated French stopword "dans" is never offered.
+    const fr = await localTags(
+      'Le café est dans le centre. Les étudiants lisent dans le café. ' +
+      'Les professeurs lisent dans le café aussi. Le café accueille les étudiants et les professeurs.');
+    check('French tags include accented café, kept whole', fr.head.includes('  - café'), fr.head);
+    check('French tags include étudiants, kept whole', fr.head.includes('  - étudiants'), fr.head);
+    check('French stopword "dans" is not suggested as a tag', !fr.head.includes('- dans'), fr.head);
+    check('French stopword "aussi" is not suggested as a tag', !fr.head.includes('- aussi'), fr.head);
+    check('French tags offered within maxTags', fr.boxes > 0 && fr.boxes <= plugin.settings.maxTags,
+      'boxes: ' + fr.boxes);
+
+    // German summary + tags: Garten/Wasser carry the note, the repeated
+    // German stopword "durch" is filtered, Vögel keeps its umlaut.
+    const deSummary = await summarise(
+      'Der Garten braucht Wasser. Die Blumen im Garten blühen durch den Regen. ' +
+      'Der Regen gibt dem Garten Wasser. Die Vögel fliegen durch den Garten.');
+    check('German summary is non-empty and led by the Garten sentence',
+      deSummary.includes('Der Garten braucht Wasser.'), deSummary);
+    const de = await localTags(
+      'Der Garten braucht Wasser. Die Blumen im Garten blühen durch den Regen. ' +
+      'Der Regen gibt dem Garten Wasser. Die Vögel fliegen durch den Garten.');
+    check('German tags include garten and wasser',
+      de.head.includes('  - garten') && de.head.includes('  - wasser'), de.head);
+    check('German stopword "durch" is not suggested as a tag', !de.head.includes('- durch'), de.head);
+
+    // Tag normalisation preserves Unicode letters (backend path returns
+    // free text, so this exercises normaliseTag directly): accented tags
+    // survive, spaces become hyphens, the numeric tag is still rejected.
+    REQUEST_HANDLER = async () => ({
+      status: 200, headers: {}, text: '',
+      json: { response: 'Café, Crème Brûlée, 123' },
+    });
+    const btUniEd = new MockEditor('Body text about coffee and desserts in the café.');
+    MODALS.length = 0;
+    await uniTagBackendCmd.editorCallback(btUniEd, { file: activeFile });
+    await flush();
+    confirmLatestModal('Add selected tags');
+    const btUniHead = btUniEd.text.split('\n---\n')[0];
+    check('accented backend tag survives normalisation (café)',
+      btUniHead.includes('  - café'), btUniHead);
+    check('accented multi-word tag survives as crème-brûlée',
+      btUniHead.includes('  - crème-brûlée'), btUniHead);
+    check('numeric tag still rejected beside Unicode tags', !btUniHead.includes('123'), btUniHead);
+    REQUEST_HANDLER = null;
+
+    // CJK: no spaces, no dictionary - overlapping bigrams. The summary
+    // of a Chinese note is non-empty and keeps its text; the top
+    // Japanese tag is the 東京 bigram (Han + Katakana runs tokenise).
+    const zhSummary = await summarise('我喜欢学习中文。中文很有趣。学习中文需要每天练习。');
+    check('Chinese summary is non-empty', zhSummary.trim().length > 0, zhSummary);
+    check('Chinese summary keeps CJK text intact', zhSummary.includes('中文'), zhSummary);
+    const ja = await localTags(
+      '東京は大きな都市です。東京タワーは有名な建物です。多くの観光客が東京タワーを訪れます。');
+    check('Japanese tags are offered (CJK bigrams)', ja.boxes > 0, 'boxes: ' + ja.boxes);
+    check('Japanese top tag is the 東京 bigram', ja.head.includes('  - 東京'), ja.head);
+
+    // English regression inside this section: the pre-1.8.0 behaviour
+    // for plain ASCII notes is unchanged.
+    const en = await localTags('Gardens need water. Water the gardens daily. Gardens grow fast.');
+    check('English tags unchanged: gardens suggested', en.head.includes('  - gardens'), en.head);
+    const enSummary = await summarise([
+      'The vault stores durable memory for the project.',
+      'Durable memory matters because context windows are small.',
+      'Memory in the vault is reviewed weekly.',
+      'Weekly review keeps the vault durable.',
+      'Unrelated filler sentence about nothing in particular.',
+      'Another unrelated sentence about entirely different things.',
+    ].join(' '));
+    check('English summary still favours the repeated-term sentences',
+      enSummary.includes('durable') || enSummary.includes('vault'), enSummary);
+
+    plugin.settings.summarySentenceCount = savedSentenceCount;
+    plugin.settings.summaryHeading = savedHeading;
+    plugin.settings.insertMode = savedInsertMode;
+  }
+
   console.log('\n' + '='.repeat(56));
   console.log('  PASSED: ' + passed + '   FAILED: ' + failed);
   console.log('='.repeat(56) + '\n');

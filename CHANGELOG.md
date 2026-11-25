@@ -3,6 +3,49 @@
 All notable changes to Elias HiveMind. Versions match `manifest.json`; each
 release is cut from the tag of the same name (no `v` prefix).
 
+## 1.8.0
+
+- **Non-English notes: Unicode tokenization + multilingual stopwords.**
+  The local engine (summarizer, tagger, link finder, backlog and
+  resurface relevance) no longer assumes plain English ASCII. Until
+  now the tokenizer only matched `[a-z0-9...]`, so accented words
+  split apart and CJK text produced almost no tokens - summaries came
+  out empty or mangled and tags were stripped of their accents, with
+  no error telling the user why.
+- **Unicode-aware tokenization.** A token is now a sequence of Unicode
+  letters/numbers, so accented Latin, Cyrillic, Greek and other
+  scripts stay whole. Every local path shares the one tokenizer, so
+  the fix applies everywhere at once.
+- **Stopwords for six languages.** The English list is joined by
+  modest, high-confidence lists for Spanish, French, German,
+  Portuguese and Italian, applied as one union: a word that is a
+  stopword in any supported language is filtered everywhere. That is
+  a deliberate trade-off - the plugin does no language detection -
+  and it can occasionally filter a content word that is a function
+  word in another language (German *die* is the stock example).
+- **CJK tokenization, honestly stated.** Chinese, Japanese and Korean
+  text has no spaces, and the plugin ships no segmentation
+  dictionary. Each run of CJK characters is instead tokenised as
+  overlapping bigrams (characters 1-2, 2-3, 3-4, ...); a
+  one-character run stays a single character and a two-character run
+  stays whole. Real words appear as bigrams, so summaries, tags and
+  relevance work; some bigrams straddle word boundaries, so CJK
+  results are useful rather than exact.
+- **Tag normalisation preserves Unicode letters.** Accented
+  characters survive (`café` stays `café`) instead of being stripped;
+  lowercasing, spaces-to-hyphens, the purely-numeric rejection and
+  the 40-character cap are unchanged, and ASCII behaviour is
+  identical.
+- **Verification:** test suite 361 checks, all passing (339 at 1.7.0;
+  +22 in a new section covering Spanish/French/German summaries and
+  tags with stopwords excluded, accented tags surviving
+  normalisation, Chinese/Japanese summaries and tags via the bigram
+  rule, and English regression). No existing check was removed,
+  weakened or changed. Typecheck (`tsc --noEmit`) clean. The built
+  `dist/main.js` is byte-identical when the patch is applied to a
+  pristine copy of the previous release's tree and rebuilt
+  (reproduce-from-patch).
+
 ## 1.7.0
 
 - **Local embeddings: related notes and semantic lookup.** Three new

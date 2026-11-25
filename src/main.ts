@@ -67,6 +67,15 @@
  *       pretending to be semantic: with no local server running, these
  *       commands say so and stop.
  *
+ *   Non-English notes
+ *     - the local engine is Unicode-aware: tokenization keeps accented
+ *       and non-Latin words whole, stopword lists cover English, Spanish,
+ *       French, German, Portuguese and Italian (applied as one union -
+ *       see the STOPWORDS comment), tag normalisation preserves Unicode
+ *       letters, and CJK text is tokenised as overlapping bigrams (no
+ *       dictionary segmentation - see cjkTokens). All still fully local
+ *       and deterministic.
+ *
  * Obsidian loads this file as CommonJS and instantiates the default export.
  */
 
@@ -353,20 +362,155 @@ function splitSentences(text: string): string[] {
   return sentences;
 }
 
+/*
+ * Stopwords: the union of modest, high-confidence lists for English and
+ * the major space-separated languages the local engine tokenises
+ * (Spanish, French, German, Portuguese, Italian). Filtering applies the
+ * UNION: a word that is a stopword in any supported language is filtered
+ * everywhere. That is a deliberate trade-off - it needs no language
+ * detection (neither deterministic nor reliable on short notes), at the
+ * cost of occasionally filtering a content word that is a function word
+ * in another language (German "die", Italian "come" are the stock
+ * examples). Lists are kept deliberately short: function words only,
+ * never words that carry topic meaning in their own language.
+ */
 const STOPWORDS = new Set(
-  ('a about above after again against all am an and any are as at be because been before being below ' +
+  (
+    // English
+    'a about above after again against all am an and any are as at be because been before being below ' +
     'between both but by can cannot could did do does doing down during each few for from further had ' +
     'has have having he her here hers herself him himself his how i if in into is it its itself just me ' +
     'more most my myself no nor not of off on once only or other ought our ours ourselves out over own ' +
     'same she should so some such than that the their theirs them themselves then there these they this ' +
     'those through to too under until up very was we were what when where which while who whom why will ' +
-    'with would you your yours yourself yourselves')
-    .split(' ')
+    'with would you your yours yourself yourselves ' +
+    // Spanish
+    'el la los las un una unos unas de del al en con por para sin sobre entre hasta desde donde cuando ' +
+    'como pero más muy ya no sí si se su sus lo le les me te nos también porque pues así tan solo hay durante ser ' +
+    'es son está están fue fueron era eran este esta estos estas ese esa eso ello ' +
+    // French
+    'le la les un une des de du au aux en et ou mais que qui quoi dont où dans sur sous chez vers entre ' +
+    'par pour avec sans ce cet cette ces mon ma mes ton ta tes son sa ses notre nos votre vos leur leurs ' +
+    'je tu il elle nous vous ils elles on ne pas plus moins très trop peu beaucoup aussi comme quand si ' +
+    'car parce donc alors même déjà encore toujours jamais souvent être est sont suis sommes êtes ont ' +
+    'ai as avons avez été avoir tout tous toute toutes autre autres y lui eux moi toi ceci cela ' +
+    // German
+    'der die das den dem des ein eine einen einem einer eines und oder aber denn wenn als wie wo was wer ' +
+    'ist sind war waren sein haben hat hatte wird werden wurde nicht auch nur noch schon sehr mehr vom ' +
+    'von zu zum zur im am ans ins für mit nach bei aus über unter zwischen durch gegen ohne um an auf es ' +
+    'er sie wir ihr man sich mich dich uns euch mein meine dein seine ihre unser dieser diese diesem ' +
+    'diesen jede jedem jeden alle ' +
+    // Portuguese
+    'o a os as um uma uns umas de do da dos das em no na nos nas por pelo pela pelos pelas e ou mas que ' +
+    'se como quando onde quem com sem para sobre entre até desde já não sim também muito mais menos ser ' +
+    'é são era eram foi foram estar está estão ter tem têm ao aos à às seu sua seus suas meu minha meus ' +
+    'minhas este esta estes estas esse essa isso aquele aquela aquilo eu tu ele ela nós eles elas lhe ' +
+    // Italian
+    'il lo la i gli le un uno una di del dello della dei degli delle a da in con su per tra fra e o ma ' +
+    'che chi cui non si come quando dove anche più molto poco tanto già ancora sempre mai così questo ' +
+    'questa questi queste quello quella quelli quelle mio mia miei mie tuo tua suoi sue nostro nostra ' +
+    'vostro loro io tu lui lei noi voi essere è sono era erano fu furono avere ha hanno aveva stare sta ' +
+    'stanno'
+  ).split(' ')
 );
 
+/**
+ * True for characters in the CJK script blocks this plugin treats as
+ * unsegmented text: Han, Hiragana, Katakana and Hangul. Checked by code
+ * point directly, so the behaviour does not depend on regex
+ * script-property support in the host WebView.
+ */
+function isCjkChar(ch: string): boolean {
+  const cp = ch.codePointAt(0) ?? 0;
+  return (
+    (cp >= 0x3400 && cp <= 0x4dbf) || // Han, extension A
+    (cp >= 0x4e00 && cp <= 0x9fff) || // Han
+    (cp >= 0xf900 && cp <= 0xfaff) || // Han compatibility ideographs
+    (cp >= 0x3040 && cp <= 0x309f) || // Hiragana
+    (cp >= 0x30a0 && cp <= 0x30ff) || // Katakana
+    (cp >= 0x31f0 && cp <= 0x31ff) || // Katakana phonetic extensions
+    (cp >= 0x1100 && cp <= 0x11ff) || // Hangul jamo
+    (cp >= 0x3130 && cp <= 0x318f) || // Hangul compatibility jamo
+    (cp >= 0xac00 && cp <= 0xd7af) // Hangul syllables
+  );
+}
+
+/** True when `word` is non-empty and every character of it is a CJK character. */
+function isCjkToken(word: string): boolean {
+  if (!word) return false;
+  for (const ch of word) {
+    if (!isCjkChar(ch)) return false;
+  }
+  return true;
+}
+
+/**
+ * Splits one maximal CJK run into tokens. There is deliberately NO
+ * dictionary segmentation - the plugin ships no dictionary and inventing
+ * one would break the deterministic, fully-local rule. The documented,
+ * deterministic rule instead: a run of one character is that character, a
+ * run of two is the pair, and a longer run becomes its overlapping
+ * bigrams (characters 1-2, 2-3, 3-4, ...). Bigrams are the standard
+ * dictionary-free unit for CJK retrieval: real words inside the run
+ * appear as bigrams, at the cost of some cross-word bigrams too.
+ */
+function cjkTokens(run: string): string[] {
+  const chars = Array.from(run);
+  if (chars.length <= 2) return [run];
+  const out: string[] = [];
+  for (let i = 0; i + 1 < chars.length; i += 1) out.push(chars[i] + chars[i + 1]);
+  return out;
+}
+
+/**
+ * Unicode-aware tokenizer: a token run is a sequence of Unicode letters
+ * or numbers (with internal apostrophes/hyphens, as before), so accented
+ * Latin, Cyrillic, Greek and every other script stay whole instead of
+ * splitting at the first non-ASCII character. A run is then split into
+ * maximal CJK / non-CJK segments; non-CJK segments are whole-word tokens
+ * and CJK segments go through the bigram rule in cjkTokens().
+ */
 function tokenize(text: string): string[] {
-  const matches = text.toLowerCase().match(/[a-z0-9][a-z0-9'-]*/g);
-  return matches ? matches : [];
+  const runs = text.toLowerCase().match(/[\p{L}\p{N}][\p{L}\p{N}'-]*/gu);
+  if (!runs) return [];
+  const tokens: string[] = [];
+  for (const run of runs) {
+    let segment = '';
+    let segmentIsCjk: boolean | null = null;
+    const flush = (): void => {
+      if (!segment) return;
+      if (segmentIsCjk) tokens.push(...cjkTokens(segment));
+      else tokens.push(segment);
+      segment = '';
+    };
+    for (const ch of run) {
+      const cjk = isCjkChar(ch);
+      if (segmentIsCjk === null || cjk === segmentIsCjk) {
+        segment += ch;
+        segmentIsCjk = cjk;
+      } else {
+        flush();
+        segment = ch;
+        segmentIsCjk = cjk;
+      }
+    }
+    flush();
+  }
+  return tokens;
+}
+
+/**
+ * The shared "is this token content?" test behind the summariser, the
+ * tagger and the corpus-overlap code: not a stopword (in any supported
+ * language), and either at least `minLength` characters or a CJK bigram.
+ * A bigram is a complete token unit under the CJK rule above despite
+ * being two characters, so the ASCII-era length floors do not silently
+ * exclude CJK text a second time.
+ */
+function isContentWord(word: string, minLength: number): boolean {
+  if (STOPWORDS.has(word)) return false;
+  if (word.length >= minLength) return true;
+  return word.length === 2 && isCjkToken(word);
 }
 
 /* ========================================================================== */
@@ -390,7 +534,7 @@ function summariseLocally(markdown: string, sentenceCount: number): string {
 
   const freq = new Map<string, number>();
   for (const word of tokenize(plain)) {
-    if (STOPWORDS.has(word) || word.length < 3) continue;
+    if (!isContentWord(word, 3)) continue;
     freq.set(word, (freq.get(word) ?? 0) + 1);
   }
 
@@ -401,7 +545,7 @@ function summariseLocally(markdown: string, sentenceCount: number): string {
   if (maxFreq === 0) return sentences.slice(0, sentenceCount).join(' ');
 
   const scored = sentences.map((sentence, index) => {
-    const words = tokenize(sentence).filter((w) => !STOPWORDS.has(w) && w.length >= 3);
+    const words = tokenize(sentence).filter((w) => isContentWord(w, 3));
     if (words.length === 0) return { index, sentence, score: 0 };
 
     let score = 0;
@@ -867,6 +1011,9 @@ function formatSimilarity(score: number): string {
 /**
  * Coerces free text into a valid Obsidian tag: lowercase, no leading '#',
  * spaces become hyphens, only letters, digits, '_', '-' and '/' survive.
+ * Letters and digits are Unicode-wide - Obsidian tags support accented
+ * and non-Latin letters, so they are preserved rather than stripped -
+ * while every other character is still removed, exactly as before.
  * Returns '' for anything unusable, including purely numeric tags, which
  * Obsidian does not treat as tags.
  */
@@ -877,12 +1024,12 @@ function normaliseTag(raw: string): string {
     .replace(/^#+/, '')
     .replace(/['"]/g, '')
     .replace(/\s+/g, '-')
-    .replace(/[^a-z0-9_/-]+/g, '')
+    .replace(/[^\p{L}\p{N}_/-]+/gu, '')
     .replace(/-{2,}/g, '-')
     .replace(/^[-/]+|[-/]+$/g, '');
 
   if (!tag || tag.length > 40) return '';
-  if (!/[a-z_/-]/.test(tag) || !Number.isNaN(Number(tag))) return '';
+  if (!/[\p{L}_/-]/u.test(tag) || !Number.isNaN(Number(tag))) return '';
   return tag;
 }
 
@@ -1055,7 +1202,7 @@ function suggestTagsLocally(
   const firstSeen = new Map<string, number>();
 
   tokenize(toPlainText(markdown)).forEach((word, index) => {
-    if (word.length < 4 || STOPWORDS.has(word)) return;
+    if (!isContentWord(word, 4)) return;
     const tag = normaliseTag(word);
     if (!tag || skip.has(tag)) return;
     freq.set(tag, (freq.get(tag) ?? 0) + 1);
@@ -1232,7 +1379,7 @@ interface MentionSpan {
 }
 
 function isWordChar(ch: string): boolean {
-  return ch !== '' && /[A-Za-z0-9_'-]/.test(ch);
+  return ch !== '' && /[\p{L}\p{N}_'-]/u.test(ch);
 }
 
 /**
@@ -1839,11 +1986,11 @@ function estimateReadMinutes(wordCount: number): number {
   return Math.max(1, Math.round(wordCount / WORDS_PER_MINUTE));
 }
 
-/** The content words of a text: four-plus letters, no stopwords. */
+/** The content words of a text: four-plus letters, no stopwords (CJK bigrams count). */
 function significantWordSet(plain: string): Set<string> {
   const set = new Set<string>();
   for (const word of tokenize(plain)) {
-    if (word.length >= 4 && !STOPWORDS.has(word)) set.add(word);
+    if (isContentWord(word, 4)) set.add(word);
   }
   return set;
 }
@@ -3593,7 +3740,7 @@ export default class EliasHiveMindPlugin extends Plugin {
     const corpusFreq = new Map<string, number>();
     for (const file of recent) {
       for (const word of tokenize(toPlainText(await this.app.vault.cachedRead(file)))) {
-        if (word.length < 4 || STOPWORDS.has(word)) continue;
+        if (!isContentWord(word, 4)) continue;
         corpusFreq.set(word, (corpusFreq.get(word) ?? 0) + 1);
       }
     }
@@ -3802,7 +3949,7 @@ export default class EliasHiveMindPlugin extends Plugin {
     const corpusFreq = new Map<string, number>();
     for (const file of recent) {
       for (const word of tokenize(toPlainText(await this.app.vault.cachedRead(file)))) {
-        if (word.length < 4 || STOPWORDS.has(word)) continue;
+        if (!isContentWord(word, 4)) continue;
         corpusFreq.set(word, (corpusFreq.get(word) ?? 0) + 1);
       }
     }

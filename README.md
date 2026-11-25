@@ -11,7 +11,7 @@ New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language st
 Download: [HiveMind-OS-Vault-v1.zip](https://github.com/elias-hivemind/obsidian-elias-hivemind/releases/download/1.5.0/HiveMind-OS-Vault-v1.zip) (attached to the 1.5.0 release)
 
 - **Plugin id:** `elias-hivemind`
-- **Version:** 1.7.0
+- **Version:** 1.8.0
 - **Minimum Obsidian version:** 1.0.0
 - **License:** MIT
 
@@ -54,7 +54,7 @@ Sends the note's plain text to a model served by Ollama (or any OpenAI-compatibl
 Suggests tags either locally or from your model. Local suggestions use the note's most frequent words of four or more letters, and prefer words that appear more than once. The suggestions appear in a checklist, and the tags you keep are merged into the note's frontmatter:
 
 - Local suggestions are **vault-aware**: the tagger reads the tags your vault already uses (from the metadata cache — no note content is read) and prefers them over words it would otherwise invent. A word that matches an established tag is suggested in the form your vault writes it, casing included, and a word matching the last part of a nested tag (the `compost` in `garden/compost`) suggests the full nested tag. Established tags also rank ahead of new words.
-- Tags are normalised to valid Obsidian tags: lowercase, no leading `#`, spaces become hyphens, and only letters, digits, `_`, `-` and `/` are kept. Purely numeric tags and tags over 40 characters are dropped.
+- Tags are normalised to valid Obsidian tags: lowercase, no leading `#`, spaces become hyphens, and only letters, digits, `_`, `-` and `/` are kept. Letters are Unicode-wide, so accented characters survive normalisation (`café` stays `café`). Purely numeric tags and tags over 40 characters are dropped.
 - Tags already in the frontmatter are never suggested again or duplicated.
 - The `tags:` field is written as a YAML list. Other frontmatter fields and the note body are not changed.
 - If the note has no frontmatter, a frontmatter block is created at the top.
@@ -129,6 +129,17 @@ Links record what you connected; embeddings find what you *meant*. Point the plu
 - **Semantic lookup: find notes by meaning** embeds a phrase you type and ranks the whole vault against it — the notes about a topic, including the ones that never use the topic's words.
 
 Honest costs: the first index of a large vault takes a while on a local server (a ~5,000-note vault is tens of minutes), and embedding is the heaviest thing the plugin does — on mobile, build the index on desktop and let it sync, or expect a slow, warm phone. With no local server running, all three commands fail plainly and change nothing; every other feature works exactly as before, fully offline.
+
+### Non-English notes
+
+The local engine — summarizer, tagger, link finder, backlog and resurface relevance — is Unicode-aware, so notes that are not plain English ASCII no longer summarise to nothing or tag into fragments:
+
+- **Tokenization** treats any sequence of Unicode letters/numbers as a word, so accented Latin, Cyrillic, Greek and other scripts stay whole (`résumé` is one word, not `r` + `sum`).
+- **Stopwords** cover English, Spanish, French, German, Portuguese and Italian. The lists are applied as one union — a word that is a stopword in any of them is filtered everywhere — because the plugin does no language detection. The trade-off is honest: a content word that happens to be a function word in another language (German *die*) is filtered too.
+- **Tags** preserve Unicode letters through normalisation, as described under Tag suggestions.
+- **CJK text** (Chinese, Japanese, Korean) has no spaces to split on, and the plugin ships no segmentation dictionary. Instead, each run of CJK characters is tokenised as overlapping bigrams — characters 1–2, 2–3, 3–4 and so on (a one-character run stays a single character, a two-character run stays whole). Real words inside the text appear as bigrams, so summaries, tags and relevance work; the cost is that some bigrams straddle word boundaries, so CJK results are useful rather than exact.
+
+Everything here is still fully local and deterministic: no network, no model, no language detection, nothing leaves the machine.
 
 ---
 
