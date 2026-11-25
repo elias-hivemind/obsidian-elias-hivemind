@@ -1,5 +1,9 @@
 # Elias HiveMind
 
+[![Release](https://img.shields.io/github/v/release/elias-hivemind/obsidian-elias-hivemind)](https://github.com/elias-hivemind/obsidian-elias-hivemind/releases)
+[![License: MIT](https://img.shields.io/github/license/elias-hivemind/obsidian-elias-hivemind)](https://github.com/elias-hivemind/obsidian-elias-hivemind/blob/main/LICENSE)
+[![Obsidian directory](https://img.shields.io/badge/Obsidian-directory-purple)](https://community.obsidian.md/plugins/elias-hivemind)
+
 Summaries, tag suggestions, link suggestions and a weekly backlog digest for Obsidian, working offline by default and using a local Ollama model when you want one.
 
 New to Obsidian? Read the [Beginner Guide](docs/HOW-TO.md) — plain-language steps from install to your first Backlog Digest.
