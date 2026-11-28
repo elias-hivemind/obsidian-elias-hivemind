@@ -515,6 +515,9 @@ shelf — local-first tools, verified working before they are trusted:
   stale seals.
 - **[nova-ops-nim-mcp](https://github.com/elias-hivemind/nova-ops-nim-mcp)** —
   an MCP server for NIM video generation, built for MCP clients.
+- **[FrameHarbor OS](https://github.com/elias-hivemind/frameharbor-os)** —
+  a free, phone-friendly workflow for publishing AI-assisted video and
+  audio without wrong AI labels. Free forever.
 
 ## Writing
 
